@@ -60,9 +60,9 @@ export IGG_CUDAAWARE_MPI=1
 export JULIA_CUDA_USE_COMPAT=false
 
 # Pass the dynamically calculated global dimensions to the Julia script
-srun --uenv julia/25.5:v1 --view=juliaup julia --project src/xpu/2d_swe_multi_xpu_wb.jl --nx $GLOBAL_NX --ny $GLOBAL_NY --dt_multiplier 1
-srun --uenv julia/25.5:v1 --view=juliaup julia --project src/xpu/2d_swe_multi_xpu_wb.jl --nx $GLOBAL_NX --ny $GLOBAL_NY --dt_multiplier 1
-srun --uenv julia/25.5:v1 --view=juliaup julia --project src/xpu/2d_swe_multi_xpu_wb.jl --nx $GLOBAL_NX --ny $GLOBAL_NY --dt_multiplier 1
+srun --uenv julia/25.5:v1 --view=juliaup julia --project src/baseline.jl --nx $GLOBAL_NX --ny $GLOBAL_NY --dt_multiplier 1
+srun --uenv julia/25.5:v1 --view=juliaup julia --project src/baseline.jl --nx $GLOBAL_NX --ny $GLOBAL_NY --dt_multiplier 1
+srun --uenv julia/25.5:v1 --view=juliaup julia --project src/baseline.jl --nx $GLOBAL_NX --ny $GLOBAL_NY --dt_multiplier 1
 EOF
 
     # Submit the generated script

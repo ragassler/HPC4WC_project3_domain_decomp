@@ -1,0 +1,15 @@
+# Saved arrays / serialized frames
+*.jls
+*.npy
+*.npz
+*.h5
+*.hdf5
+*.nc
+
+# Generated plots
+plots/
+**/plots/
+*.png
+*.pdf
+*.svg
+*.eps

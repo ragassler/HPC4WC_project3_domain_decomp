@@ -1,13 +1,5 @@
 using Serialization
 
-const HAS_MAKIE = try
-    @eval using GLMakie
-    true
-catch
-    @info "GLMakie not found. Falling back to array output."
-    false
-end
-
 using StaticArrays
 using Random
 
@@ -1076,7 +1068,7 @@ function build_topography(xs, ys; islands=Island[], background=nothing)
 end
 
 """
-    load_topography_data(nx_aoi_ext, ny_aoi_ext, nx_local, ny_local, me, coords, comm_cart)
+    load_topography_data(nx_aoi_ext, ny_aoi_ext, nx_local, ny_local, me, grid_ref)
 
 Load bathymetry and initial free surface, then distribute local slices.
 
@@ -1084,14 +1076,13 @@ Load bathymetry and initial free surface, then distribute local slices.
 - nx_aoi_ext, ny_aoi_ext: AOI resolution used for interpolation.
 - nx_local, ny_local: Local grid dimensions including halos.
 - me: MPI rank id.
-- coords: MPI Cartesian coordinates of the rank.
-- comm_cart: MPI Cartesian communicator.
+- grid_ref: Local IGG-distributed array used with `x_g`/`y_g` to map local to global indices.
 
 # Returns
 - z: Local bathymetry array (ParallelStencil backend).
 - η0: Local initial free-surface array (ParallelStencil backend).
 """
-function load_topography_data(nx_aoi_ext, ny_aoi_ext, nx_local, ny_local, me, coords, comm_cart)
+function load_topography_data(nx_aoi_ext, ny_aoi_ext, nx_local, ny_local, me, grid_ref)
     # Use the true global dimensions dictated by ImplicitGlobalGrid
     NX = nx_g()
     NY = ny_g()
@@ -1174,8 +1165,8 @@ function load_topography_data(nx_aoi_ext, ny_aoi_ext, nx_local, ny_local, me, co
     end
 
     # Broadcast the completed global arrays from Rank 0 to all other ranks
-    MPI.Bcast!(z_global, 0, comm_cart)
-    MPI.Bcast!(η0_global, 0, comm_cart)
+    MPI.Bcast!(z_global, 0, MPI.COMM_WORLD)
+    MPI.Bcast!(η0_global, 0, MPI.COMM_WORLD)
 
     # Each rank mathematically extracts its local slice (including halos!)
     z_local = zeros(nx_local, ny_local)
@@ -1183,9 +1174,11 @@ function load_topography_data(nx_aoi_ext, ny_aoi_ext, nx_local, ny_local, me, co
 
     for ix in 1:nx_local
         for iy in 1:ny_local
-            # Map local index to global index based on MPI Cartesian coordinates
-            IX = coords[1] * (nx_local - 2) + ix
-            IY = coords[2] * (ny_local - 2) + iy
+            # Map local indices to global indices through IGG, as in the
+            # porous-convection code. With unit spacing, x_g/y_g return the
+            # zero-based global grid index for this local array location.
+            IX = round(Int, x_g(ix, 1.0, grid_ref)) + 1
+            IY = round(Int, y_g(iy, 1.0, grid_ref)) + 1
             
             z_local[ix, iy] = z_global[IX, IY]
             η0_local[ix, iy] = η0_global[IX, IY]
@@ -1202,7 +1195,7 @@ end
 
 """
     swe2d_topography_frames(nx_aoi, ny_aoi; nt=0, outdir="frames",
-                            do_viz=true, force_array_output=false,
+                            do_viz=true,
                             debug_roi=false, print_error_metrics=true,
                             gpu_test_memory_restriction_workound=false,
                             domain_expansion_factor=3.0)
@@ -1213,8 +1206,7 @@ Run the 2D well-balanced SWE solver with MPI domain decomposition.
 - nx_aoi, ny_aoi: Resolution of the area of interest.
 - nt: Number of timesteps (0 uses an nx-based default).
 - outdir: Output directory for frames or arrays.
-- do_viz: Enable visualization or array output.
-- force_array_output: Force array output even if Makie is available.
+- do_viz: Enable serialized array output.
 - debug_roi: Visualize the full domain instead of the ROI.
 - print_error_metrics: Print steady-state error metrics on rank 0.
 - gpu_test_memory_restriction_workound: Use smaller domain for GPU tests.
@@ -1227,7 +1219,6 @@ Run the 2D well-balanced SWE solver with MPI domain decomposition.
             nt=0,
             outdir = "frames", 
             do_viz = true, 
-            force_array_output = false, 
             debug_roi=false,
             print_error_metrics=true,
             gpu_test_memory_restriction_workound=false,
@@ -1249,36 +1240,24 @@ Run the 2D well-balanced SWE solver with MPI domain decomposition.
     nx_global = round(Int, domain_expansion_factor * nx_aoi)
     ny_global = round(Int, domain_expansion_factor * ny_aoi)
 
-    # get num ranks
-    if !MPI.Initialized()
-        MPI.Init()
-    end
-    nprocs = MPI.Comm_size(MPI.COMM_WORLD)
-
     # Force a 2D MPI topology.
     dims_mpi = [2, 2]
-    if prod(dims_mpi) != nprocs
-        error("Requested MPI topology $(dims_mpi[1])x$(dims_mpi[2]) requires $(prod(dims_mpi)) ranks, but got $nprocs. Run with: mpiexec -n $(prod(dims_mpi)) julia --project src/xpu/2d_swe_multi_xpu_wb.jl")
-    end
 
     # Compute local chunk sizes (+2 for halos)
     nx = round(Int, (nx_global - 2) / dims_mpi[1]) + 2
     ny = round(Int, (ny_global - 2) / dims_mpi[2]) + 2
 
-    # Init global grid and get local grid info
-    me, dims, nprocs, coords, comm_cart = init_global_grid(
-        nx, ny, 1; 
-        dimx = dims_mpi[1],
-        dimy = dims_mpi[2],
-        dimz = 1,
-        init_MPI = false, 
-        select_device = false
-    )
+    # Initialize and let ImplicitGlobalGrid own MPI, exactly as in the
+    # porous-convection multi-XPU code. For the standard 4-rank run and the
+    # square local grid, IGG selects a 2 x 2 x 1 decomposition.
+    me, dims = init_global_grid(nx, ny, 1, select_device=false)
 
-    neighbors_x = MPI.Cart_shift(comm_cart, 0, 1) 
-    neighbors_y = MPI.Cart_shift(comm_cart, 1, 1)
-    
-    b_width     = (8, 8, 0)
+    if dims[1] != dims_mpi[1] || dims[2] != dims_mpi[2] || dims[3] != 1
+        finalize_global_grid()
+        error("This baseline preserves the original 500x500 decomposition and requires a 2x2x1 IGG topology. Run with 4 MPI ranks.")
+    end
+
+    b_width = (8, 8, 0)
 
     if nt==0
         nt   = Int(nt_nx_multiplier * nx_aoi)
@@ -1321,6 +1300,13 @@ Run the 2D well-balanced SWE solver with MPI domain decomposition.
     xs = [x_g(ix, dx, h) - lx / 2 for ix in 1:nx]
     ys = [y_g(iy, dy, h) - ly / 2 for iy in 1:ny]
 
+    # Identify only the physical outer boundaries from IGG global
+    # coordinates. Internal local-array edges remain MPI interfaces.
+    is_left   = round(Int, x_g(1,  1.0, h)) == 0
+    is_right  = round(Int, x_g(nx, 1.0, h)) == nx_g() - 1
+    is_bottom = round(Int, y_g(1,  1.0, h)) == 0
+    is_top    = round(Int, y_g(ny, 1.0, h)) == ny_g() - 1
+
     # fluxes
     F₁ = @zeros(nx - 1, ny)
     F₂ = @zeros(nx - 1, ny)
@@ -1347,7 +1333,7 @@ Run the 2D well-balanced SWE solver with MPI domain decomposition.
 
     ## DEFAULT TOPOGRAPHY: Load from file and interpolate to the grid
     if !gpu_test_memory_restriction_workound
-        z, η0 = load_topography_data(nx_aoi, ny_aoi, nx, ny, me, coords, comm_cart)
+        z, η0 = load_topography_data(nx_aoi, ny_aoi, nx, ny, me, h)
     else
         # -------------------------------------------------------------------------
         # topography (Analytical for Scaling Study)
@@ -1356,22 +1342,18 @@ Run the 2D well-balanced SWE solver with MPI domain decomposition.
         z_local  = zeros(nx, ny)
         η0_local = zeros(nx, ny)
 
-        # Physics parameters for the analytical test
-        h_base  = 15.0   # Base water depth
-        A_spike = 5.0    # Height of the Gaussian bump
-        σ_spike = max(lx, ly) / 100 # Width of the bump (scales with domain)
+        # Simple analytical baseline: flat bottom and one free-surface bump.
+        h_base  = 15.0
+        A_spike = 2.0
+        σ_spike = max(lx, ly) / 12
 
         for i in 1:nx
             for j in 1:ny
                 x = xs[i]
                 y = ys[j]
-                
-                # Flat bathymetry
+
                 z_local[i, j] = 0.0
-                
-                # Gaussian bump centered at global (0,0) + bumps at each local center 
-                η0_local[i, j] = h_base + A_spike * exp(-(x^2 + y^2) / (2 * σ_spike^2)) +
-                                        A_spike * exp(-(((x - xs[div(nx,2)])^2 + (y - ys[div(ny,2)])^2)) / (2 * σ_spike^2))
+                η0_local[i, j] = h_base + A_spike * exp(-(x^2 + y^2) / (2 * σ_spike^2))
             end
         end
 
@@ -1450,12 +1432,10 @@ Run the 2D well-balanced SWE solver with MPI domain decomposition.
     # -------------------------------------------------------------------------
 
     if do_viz
-        use_makie = HAS_MAKIE && !force_array_output
-        print("Using visualization: ", use_makie ? "Makie" : "Array output")
+        if me == 0
+            println("Using visualization: Array output")
+        end
         mkpath(outdir)
-
-        vertical_exaggeration = 6.0
-        hmin_plot = 1e-3
         
         nx_v, ny_v = (nx - 2) * dims[1], (ny - 2) * dims[2]
         h_v   = zeros(nx_v, ny_v)
@@ -1484,78 +1464,19 @@ Run the 2D well-balanced SWE solver with MPI domain decomposition.
             h_slice = h_v[ix_roi_v, iy_roi_v]
             z_slice = z_v[ix_roi_v, iy_roi_v]
 
-            if use_makie
-
-                z_plot = vertical_exaggeration .* z_slice
-
-                # terrain color as full matrix, not a single Symbol
-                terrain_color = fill(RGBf(0.82, 0.82, 0.82), size(z_plot))
-
-                η_water_plot0  = vertical_exaggeration .* (h_slice .+ z_slice)
-                η_water_color0 = h_slice .+ z_slice
-
-                η_water_plot0[h_slice .<= hmin_plot]  .= NaN
-                η_water_color0[h_slice .<= hmin_plot] .= NaN
-
-                η_water_plot  = Observable(η_water_plot0)
-                η_water_color = Observable(η_water_color0)
-
-                fig = Figure(size = (1200, 900))
-                ax = Axis3(
-                    fig[1, 1],
-                    xlabel = "x",
-                    ylabel = "y",
-                    zlabel = "height",
-                    aspect = (1, 1, 0.25),
-                    azimuth = -1.1 - π/2,
-                    elevation = 0.45,
-                    perspectiveness = 0.35
-                )
-
-                # gray terrain / islands
-                surface!(ax, xs_roi_v, ys_roi_v, z_plot;
-                    color = terrain_color,
-                    shading = true
-                )
-
-                # water only
-                water = surface!(ax, xs_roi_v, ys_roi_v, η_water_plot;
-                    color = η_water_color,
-                    colormap = :turbo,
-                    colorrange = (-10, 20),
-                    shading = true
-                )
-
-                Colorbar(fig[1, 2], water, label = "free surface")
-                display(fig)
-
-                frame_id = Ref(0)
-
-                function save_frame!()
-                    frame_id[] += 1
-                    fname = joinpath(outdir, @sprintf("frame_%06d.png", frame_id[]))
-                    save(fname, fig)
-                end
-                save_frame!()
-            else
-                frame_id = Ref(0)
-                @info "Saving arrays to $outdir"
-                function save_array!()
-                    frame_id[] += 1
-                    # Save as a standard Julia serialized file
-                    fname = joinpath(outdir, @sprintf("array_frame_%06d.jls", frame_id[]))
-                    # Storing a NamedTuple containing the ROI arrays
-                    serialize(fname, (h=Array(convert.(Float32, h_slice)),)) 
-                end
-                function save_array_with_z!()
-                    frame_id[] += 1
-                    # Save as a standard Julia serialized file
-                    fname = joinpath(outdir, @sprintf("array_frame_%06d.jls", frame_id[]))
-                    # Storing a NamedTuple containing the ROI arrays
-                    serialize(fname, (h=Array(convert.(Float32, h_slice)), z=Array(convert.(Float32, z_slice))))
-                end
-                save_array_with_z!()
+            frame_id = Ref(0)
+            @info "Saving arrays to $outdir"
+            function save_array!()
+                frame_id[] += 1
+                fname = joinpath(outdir, @sprintf("array_frame_%06d.jls", frame_id[]))
+                serialize(fname, (h=Array(convert.(Float32, h_slice)),)) 
             end
+            function save_array_with_z!()
+                frame_id[] += 1
+                fname = joinpath(outdir, @sprintf("array_frame_%06d.jls", frame_id[]))
+                serialize(fname, (h=Array(convert.(Float32, h_slice)), z=Array(convert.(Float32, z_slice))))
+            end
+            save_array_with_z!()
         end
     end
 
@@ -1618,16 +1539,19 @@ Run the 2D well-balanced SWE solver with MPI domain decomposition.
         @parallel dry_cell_fix!(h, hu, hv, hmin)
 
         # Apply BCs only on ranks that border the global domain boundaries
-        if neighbors_x[1] == MPI.PROC_NULL
+        if is_left
             @parallel (1:ny) left_bc!(h, hu, hv, g, dt, _dx)
         end
-        if neighbors_x[2] == MPI.PROC_NULL
+
+        if is_right
             @parallel (1:ny) right_bc!(h, hu, hv, g, dt, _dx)
         end
-        if neighbors_y[1] == MPI.PROC_NULL
+
+        if is_bottom
             @parallel (1:nx) bottom_bc!(h, hu, hv, g, dt, _dy)
         end
-        if neighbors_y[2] == MPI.PROC_NULL
+
+        if is_top
             @parallel (1:nx) top_bc!(h, hu, hv, g, dt, _dy)
         end
         
@@ -1646,21 +1570,8 @@ Run the 2D well-balanced SWE solver with MPI domain decomposition.
             if me == 0
                 h_slice = h_v[ix_roi_v, iy_roi_v]
                 z_slice = z_v[ix_roi_v, iy_roi_v]
-                
-                if use_makie
-                    ηtmp_plot  = vertical_exaggeration .* (h_slice .+ z_slice)
-                    ηtmp_color = h_slice .+ z_slice
-
-                    ηtmp_plot[h_slice .<= hmin_plot]  .= NaN
-                    ηtmp_color[h_slice .<= hmin_plot] .= NaN
-
-                    η_water_plot[]  = ηtmp_plot
-                    η_water_color[] = ηtmp_color
-
-                    save_frame!()
-                else
-                    save_array!()
-                end
+                save_array!()
+                println("Saved frame $(frame_id[]) to: $(abspath(outdir))")
             end
         end
         
@@ -1685,13 +1596,13 @@ Run the 2D well-balanced SWE solver with MPI domain decomposition.
     wet_mask = (η0 .- z .> h_eps) .& (h .> h_eps)
 
     local_nwet = sum(wet_mask)
-    nwet = MPI.Allreduce(local_nwet, MPI.SUM, comm_cart)
+    nwet = MPI.Allreduce(local_nwet, MPI.SUM, MPI.COMM_WORLD)
     
     local_err_max = local_nwet > 0 ? maximum(err[wet_mask]) : 0.0
     local_scale_max = local_nwet > 0 ? maximum(abs.(η0[wet_mask])) : 0.0
 
-    Linf_abs = MPI.Allreduce(local_err_max, MPI.MAX, comm_cart)
-    η0_scale = MPI.Allreduce(local_scale_max, MPI.MAX, comm_cart)
+    Linf_abs = MPI.Allreduce(local_err_max, MPI.MAX, MPI.COMM_WORLD)
+    η0_scale = MPI.Allreduce(local_scale_max, MPI.MAX, MPI.COMM_WORLD)
 
     if me == 0 && print_error_metrics
         if nwet > 0
@@ -1717,29 +1628,38 @@ Run the 2D well-balanced SWE solver with MPI domain decomposition.
             println("\nSaved $(frame_id[]) frames to: $(abspath(outdir))")
         end
     end
-
+    # IGG performs the matching MPI cleanup/finalization, as in the
+    # porous-convection multi-XPU code.
     finalize_global_grid()
     return nothing
+
 end
 
 input_nx = 500
 input_ny = 500
-num_repetitions = 1
+input_nt = 2000
+input_outdir = "docs/frames/frames_topography_multi"
+input_do_viz = false
 
 for i in 1:length(ARGS)
     if ARGS[i] == "--nx"
         global input_nx = parse(Int, ARGS[i+1])
     elseif ARGS[i] == "--ny"
         global input_ny = parse(Int, ARGS[i+1])
+    elseif ARGS[i] == "--nt"
+        global input_nt = parse(Int, ARGS[i+1])
+    elseif ARGS[i] == "--outdir"
+        global input_outdir = ARGS[i+1]
+    elseif ARGS[i] == "--viz"
+        global input_do_viz = true
     elseif ARGS[i] == "--dt_multiplier"
         global nt_nx_multiplier = parse(Float64, ARGS[i+1])
     end
 end
 
-@time swe2d_topography_frames(input_nx, input_ny; nt=2000,
-    outdir = "docs/frames/frames_topography_multi",
-    do_viz = false,
-    force_array_output = false,
+swe2d_topography_frames(input_nx, input_ny; nt=input_nt,
+    outdir = input_outdir,
+    do_viz = input_do_viz,
     print_error_metrics = false,
     gpu_test_memory_restriction_workound = true,
     domain_expansion_factor = 3.0
