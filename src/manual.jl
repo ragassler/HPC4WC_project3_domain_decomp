@@ -1,41 +1,1447 @@
-using MPI
-using ImplicitGlobalGrid
+using Serialization
 
-function main()
-    # Own MPI explicitly and disable MPI.jl's automatic atexit hook.
-    provided = MPI.Init(
-        threadlevel = :serialized,
-        finalize_atexit = false
-    )
+import MPI
 
-    me, dims = init_global_grid(
-        16, 16, 1;
-        init_MPI = false,
-        select_device = false
-    )
 
-    println(
-        "Rank $me initialized; dims=$(Tuple(dims)); " *
-        "thread support=$provided"
-    )
-    flush(stdout)
+const CLI_BENCHMARK_MODE = "--benchmark" in ARGS
+const USE_GPU = false
+using ParallelStencil
+using ParallelStencil.FiniteDifferences2D
+import ParallelStencil: @reset_parallel_stencil
 
-    # Destroy the IGG grid, but do not finalize MPI through IGG.
-    finalize_global_grid(finalize_MPI = false)
+@static if USE_GPU
+    @init_parallel_stencil(CUDA, Float64, 2, inbounds=false)
+else
+    @init_parallel_stencil(Threads, Float64, 2, inbounds=false)
+    if !CLI_BENCHMARK_MODE
+        @info "threads" Threads.nthreads()
+    end
+end
 
-    println("Rank $me finalized IGG")
-    flush(stdout)
+using Printf
 
-    # Explicitly finalize MPI.
-    MPI.Finalize()
+const h_eps = 1e-2
 
-    println(
-        "Rank $me returned from MPI.Finalize(); " *
-        "MPI.Finalized()=$(MPI.Finalized())"
-    )
-    flush(stdout)
+"""
+    avx_comp(hv1, hv2, h, ix, iy)
+
+    Compute the x-face average of hv1*hv2/h between cells (ix,iy) and (ix+1,iy).
+
+    # Arguments
+    - hv1, hv2: Momentum-like arrays.
+    - h: Water-depth array.
+    - ix, iy: Cell indices.
+
+    # Returns
+    - Scalar face-averaged value in x.
+"""
+@inline avx_comp(hv1, hv2, h, ix, iy) = 0.5 * (hv1[ix, iy] * hv2[ix, iy] / h[ix, iy] + hv1[ix+1, iy] * hv2[ix+1, iy] / h[ix+1, iy])
+
+"""
+    avy_comp(hv1, hv2, h, ix, iy)
+
+    Compute the y-face average of hv1*hv2/h between cells (ix,iy) and (ix,iy+1).
+
+    # Arguments
+    - hv1, hv2: Momentum-like arrays.
+    - h: Water-depth array.
+    - ix, iy: Cell indices.
+
+    # Returns
+    - Scalar face-averaged value in y.
+"""
+@inline avy_comp(hv1, hv2, h, ix, iy) = 0.5 * (hv1[ix, iy] * hv2[ix, iy] / h[ix, iy] + hv1[ix, iy+1] * hv2[ix, iy+1] / h[ix, iy+1])
+
+"""
+        avx_simp(h, ix, iy)
+
+    Compute the simple x-face average of h^2 between cells (ix,iy) and (ix+1,iy).
+
+    # Arguments
+    - h: Water-depth array.
+    - ix, iy: Cell indices.
+
+    # Returns
+    - Scalar average of squared depth in x.
+"""
+@inline avx_simp(h, ix, iy) = 0.5 * (h[ix, iy] * h[ix, iy] + h[ix+1, iy] * h[ix+1, iy])
+
+"""
+    avy_simp(h, ix, iy)
+
+    Compute the simple y-face average of h^2 between cells (ix,iy) and (ix,iy+1).
+
+    # Arguments
+    - h: Water-depth array.
+    - ix, iy: Cell indices.
+
+    # Returns
+    - Scalar average of squared depth in y.
+"""
+@inline avy_simp(h, ix, iy) = 0.5 * (h[ix, iy] * h[ix, iy] + h[ix, iy+1] * h[ix, iy+1])
+
+"""
+    dxa(h, ix, iy)
+
+    Forward difference in x at cell (ix,iy).
+
+    # Arguments
+    - h: Input array.
+    - ix, iy: Cell indices.
+
+    # Returns
+    - h[ix+1,iy] - h[ix,iy].
+"""
+@inline dxa(h, ix, iy) = h[ix+1, iy] - h[ix, iy]
+
+"""
+    dya(h, ix, iy)
+
+    Forward difference in y at cell (ix,iy).
+
+    # Arguments
+    - h: Input array.
+    - ix, iy: Cell indices.
+
+    # Returns
+    - h[ix,iy+1] - h[ix,iy].
+"""
+@inline dya(h, ix, iy) = h[ix, iy+1] - h[ix, iy]
+
+"""
+    dxb(h, ix, iy)
+
+    Backward difference in x at cell (ix,iy).
+
+    # Arguments
+    - h: Input array.
+    - ix, iy: Cell indices.
+
+    # Returns
+    - h[ix,iy] - h[ix-1,iy].
+"""
+@inline dxb(h, ix, iy) = h[ix, iy] - h[ix-1, iy]
+
+"""
+    dyb(h, ix, iy)
+
+    Backward difference in y at cell (ix,iy).
+
+    # Arguments
+    - h: Input array.
+    - ix, iy: Cell indices.
+
+    # Returns
+    - h[ix,iy] - h[ix,iy-1].
+"""
+@inline dyb(h, ix, iy) = h[ix, iy] - h[ix, iy-1]
+
+"""
+    eta(h, z, ix, iy)
+
+    Compute the free-surface elevation eta = h + z at (ix,iy).
+
+    # Arguments
+    - h: Water-depth array.
+    - z: Bathymetry array.
+    - ix, iy: Cell indices.
+
+    # Returns
+    - Scalar free-surface elevation.
+"""
+@inline eta(h, z, ix, iy) = h[ix, iy] + z[ix, iy]
+
+"""
+    zx_face(z, ix, iy)
+
+    Compute the x-face average of bathymetry between (ix,iy) and (ix+1,iy).
+
+    # Arguments
+    - z: Bathymetry array.
+    - ix, iy: Cell indices.
+
+    # Returns
+    - Scalar face-averaged bathymetry in x.
+"""
+@inline zx_face(z, ix, iy) = 0.5 * (z[ix, iy] + z[ix+1, iy])
+
+"""
+    zy_face(z, ix, iy)
+
+    Compute the y-face average of bathymetry between (ix,iy) and (ix,iy+1).
+
+    # Arguments
+    - z: Bathymetry array.
+    - ix, iy: Cell indices.
+
+    # Returns
+    - Scalar face-averaged bathymetry in y.
+"""
+@inline zy_face(z, ix, iy) = 0.5 * (z[ix, iy] + z[ix, iy+1])
+
+"""
+    hx_L(h, z, ix, iy)
+
+    Reconstructed left depth at the x-face between (ix,iy) and (ix+1,iy).
+
+    # Arguments
+    - h: Water-depth array.
+    - z: Bathymetry array.
+    - ix, iy: Cell indices.
+
+    # Returns
+    - Non-negative reconstructed depth on the left side.
+"""
+@inline hx_L(h, z, ix, iy) =
+    max(0.0, eta(h, z, ix, iy) - zx_face(z, ix, iy))
+
+"""
+    hx_R(h, z, ix, iy)
+
+    Reconstructed right depth at the x-face between (ix,iy) and (ix+1,iy).
+
+    # Arguments
+    - h: Water-depth array.
+    - z: Bathymetry array.
+    - ix, iy: Cell indices.
+
+    # Returns
+    - Non-negative reconstructed depth on the right side.
+"""
+@inline hx_R(h, z, ix, iy) =
+    max(0.0, eta(h, z, ix+1, iy) - zx_face(z, ix, iy))
+
+"""
+    hy_L(h, z, ix, iy)
+
+    Reconstructed left depth at the y-face between (ix,iy) and (ix,iy+1).
+
+    # Arguments
+    - h: Water-depth array.
+    - z: Bathymetry array.
+    - ix, iy: Cell indices.
+
+    # Returns
+    - Non-negative reconstructed depth on the left side.
+"""
+@inline hy_L(h, z, ix, iy) =
+    max(0.0, eta(h, z, ix, iy) - zy_face(z, ix, iy))
+
+"""
+    hy_R(h, z, ix, iy)
+
+    Reconstructed right depth at the y-face between (ix,iy) and (ix,iy+1).
+
+    # Arguments
+    - h: Water-depth array.
+    - z: Bathymetry array.
+    - ix, iy: Cell indices.
+
+    # Returns
+    - Non-negative reconstructed depth on the right side.
+"""
+@inline hy_R(h, z, ix, iy) =
+    max(0.0, eta(h, z, ix, iy+1) - zy_face(z, ix, iy))
+
+"""
+    desing_velocity(hval, qval, vel_eps)
+
+    Compute a depth-limited velocity from depth and momentum.
+
+    # Arguments
+    - hval: Local depth value.
+    - qval: Local momentum value.
+    - vel_eps: Regularization parameter to avoid division by zero.
+
+    # Returns
+    - Scalar velocity, zero in dry cells.
+"""
+@inline function desing_velocity(hval, qval, vel_eps)
+    if hval <= 0.0
+        return 0.0
+    end
+
+    return sqrt(2.0) * hval * qval /
+           sqrt(hval^4 + max(hval^4, vel_eps))
+end
+
+"""
+    vel_u(h, hu, ix, iy, vel_eps)
+
+    Compute the x-velocity from depth and x-momentum at (ix,iy).
+
+    # Arguments
+    - h: Water-depth array.
+    - hu: x-momentum array.
+    - ix, iy: Cell indices.
+    - vel_eps: Regularization parameter.
+
+    # Returns
+    - Scalar x-velocity.
+"""
+@inline vel_u(h, hu, ix, iy, vel_eps) =
+    desing_velocity(h[ix, iy], hu[ix, iy], vel_eps)
+
+"""
+    vel_v(h, hv, ix, iy, vel_eps)
+
+    Compute the y-velocity from depth and y-momentum at (ix,iy).
+
+    # Arguments
+    - h: Water-depth array.
+    - hv: y-momentum array.
+    - ix, iy: Cell indices.
+    - vel_eps: Regularization parameter.
+
+    # Returns
+    - Scalar y-velocity.
+"""
+@inline vel_v(h, hv, ix, iy, vel_eps) =
+    desing_velocity(h[ix, iy], hv[ix, iy], vel_eps)
+
+"""
+    bc_speed_x(h, hu, ix, iy, g)
+
+    Compute characteristic boundary speed in x for the radiative BCs.
+
+    # Arguments
+    - h: Water-depth array.
+    - hu: x-momentum array.
+    - ix, iy: Cell indices.
+    - g: Gravity constant.
+
+    # Returns
+    - Scalar wave speed estimate in x.
+"""
+@inline bc_speed_x(h, hu, ix, iy, g) =
+    h[ix, iy] > h_eps ?
+        abs(hu[ix, iy] / h[ix, iy]) + sqrt(g * h[ix, iy]) :
+        0.0
+
+"""
+    bc_speed_y(h, hv, ix, iy, g)
+
+    Compute characteristic boundary speed in y for the radiative BCs.
+
+    # Arguments
+    - h: Water-depth array.
+    - hv: y-momentum array.
+    - ix, iy: Cell indices.
+    - g: Gravity constant.
+
+    # Returns
+    - Scalar wave speed estimate in y.
+"""
+@inline bc_speed_y(h, hv, ix, iy, g) =
+    h[ix, iy] > h_eps ?
+        abs(hv[ix, iy] / h[ix, iy]) + sqrt(g * h[ix, iy]) :
+        0.0
+
+const g = 1.0
+
+"""
+    min_g(A)
+
+    Compute the global minimum of array A across all MPI ranks.
+
+    # Arguments
+    - A: Local array on the current rank.
+
+    # Returns
+    - Scalar minimum value over the global domain.
+"""
+min_g(A, comm=MPI.COMM_WORLD) = (min_l = minimum(A); MPI.Allreduce(min_l, MPI.MIN, comm))
+
+"""
+    max_g(A)
+
+    Compute the global maximum of array A across all MPI ranks.
+
+    # Arguments
+    - A: Local array on the current rank.
+
+    # Returns
+    - Scalar maximum value over the global domain.
+"""
+max_g(A, comm=MPI.COMM_WORLD) = (max_l = maximum(A); MPI.Allreduce(max_l, MPI.MAX, comm))
+
+function gather_global_array_manual!(local_interior, global_array, comm_cart)
+    # DIFF manual/baseline: this replaces IGG's gather!. Each rank sends its
+    # local interior as a flat buffer; rank 0 unpacks chunks according to the
+    # Cartesian rank coordinates.
+    me = MPI.Comm_rank(comm_cart)
+    nprocs = MPI.Comm_size(comm_cart)
+    dims, _, _ = MPI.Cart_get(comm_cart)
+
+    local_nx, local_ny = size(local_interior)
+    sendbuf = vec(local_interior)
+    counts = fill(length(sendbuf), nprocs)
+
+    if me == 0
+        expected_size = (local_nx * dims[1], local_ny * dims[2])
+        @assert size(global_array) == expected_size
+
+        recvbuf_data = similar(sendbuf, sum(counts))
+        recvbuf = MPI.VBuffer(recvbuf_data, counts)
+        MPI.Gatherv!(sendbuf, recvbuf, comm_cart; root=0)
+
+        offset = 1
+        for rank in 0:(nprocs - 1)
+            coords = MPI.Cart_coords(comm_cart, rank)
+            ix0 = coords[1] * local_nx + 1
+            iy0 = coords[2] * local_ny + 1
+            chunk = @view recvbuf_data[offset:(offset + counts[rank + 1] - 1)]
+            global_array[ix0:(ix0 + local_nx - 1), iy0:(iy0 + local_ny - 1)] .=
+                reshape(chunk, local_nx, local_ny)
+            offset += counts[rank + 1]
+        end
+    else
+        MPI.Gatherv!(sendbuf, nothing, comm_cart; root=0)
+    end
+
+    return global_array
+end
+
+"""
+    save_domain_decomposition!(outdir; ...)
+
+    Gather and serialize the MPI domain ownership map without using any plotting
+    libraries. The output is meant to be consumed by scripts that visualize or
+    inspect the decomposition after the simulation has run.
+"""
+function save_domain_decomposition!(outdir;
+        me,
+        dims,
+        nprocs,
+        nx,
+        ny,
+        nx_global,
+        ny_global,
+        nx_field,
+        ny_field,
+        lx,
+        ly,
+        dx,
+        dy,
+        comm_cart,
+        ix_roi,
+        iy_roi,
+        filename="domain_decomposition.jls")
+
+    rank_local = fill(Float32(me), nx - 2, ny - 2)
+    rank_global = zeros(Float32, (nx - 2) * dims[1], (ny - 2) * dims[2])
+    # DIFF manual/baseline: manual gather path; baseline.jl calls IGG gather!.
+    gather_global_array_manual!(rank_local, rank_global, comm_cart)
+
+    mkpath(outdir)
+
+    if me == 0
+        payload = (
+            format = "hpc4wc_domain_decomposition_v1",
+            rank = rank_global,
+            dims = Tuple(dims[1:2]),
+            nprocs = nprocs,
+            local_size_with_halo = (nx, ny),
+            global_size_with_halo = (nx_global, ny_global),
+            interior_size_global = size(rank_global),
+            field_size = (nx_field, ny_field),
+            roi_indices = (collect(ix_roi), collect(iy_roi)),
+            domain = (lx = lx, ly = ly),
+            spacing = (dx = dx, dy = dy),
+        )
+        fname = joinpath(outdir, filename)
+        serialize(fname, payload)
+        @info "Saved domain decomposition to $fname"
+    end
 
     return nothing
 end
 
-main()
+# -----------------------------------------------------------------------------
+# Kernels
+# -----------------------------------------------------------------------------
+
+"""
+    compute_maxspeed!(max_speed_x, max_speed_y, h, hu, hv, z, g, vel_eps)
+
+    Compute local maximum wave speeds on all x- and y-faces.
+
+    # Arguments
+    - max_speed_x, max_speed_y: Output arrays for x- and y-face speeds.
+    - h, hu, hv: Water depth and momentum fields.
+    - z: Bathymetry field.
+    - g: Gravity constant.
+    - vel_eps: Velocity regularization parameter.
+
+    # Returns
+    - Nothing. Writes to max_speed_x and max_speed_y.
+"""
+@parallel_indices (ix, iy) function compute_maxspeed!(
+    max_speed_x, max_speed_y,
+    h, hu, hv, z, g, vel_eps
+)
+    nx, ny = size(h)
+
+    if ix <= nx - 1 && iy <= ny
+        hL = hx_L(h, z, ix, iy)
+        hR = hx_R(h, z, ix, iy)
+
+        uL = vel_u(h, hu, ix, iy, vel_eps)
+        uR = vel_u(h, hu, ix+1, iy, vel_eps)
+
+        max_speed_x[ix, iy] = max(
+            abs(uL) + sqrt(g * hL),
+            abs(uR) + sqrt(g * hR)
+        )
+    end
+
+    if ix <= nx && iy <= ny - 1
+        hL = hy_L(h, z, ix, iy)
+        hR = hy_R(h, z, ix, iy)
+
+        vL = vel_v(h, hv, ix, iy, vel_eps)
+        vR = vel_v(h, hv, ix, iy+1, vel_eps)
+
+        max_speed_y[ix, iy] = max(
+            abs(vL) + sqrt(g * hL),
+            abs(vR) + sqrt(g * hR)
+        )
+    end
+
+    return nothing
+end
+
+"""
+    compute_draining_timestep!(dt_drain, F₁, G₁, h, dt, _dx, _dy)
+
+    Compute the draining timestep constraint per cell based on outgoing fluxes.
+
+    # Arguments
+    - dt_drain: Output array of local drain timesteps.
+    - F₁, G₁: Mass fluxes in x and y.
+    - h: Water-depth array.
+    - dt: Current global timestep.
+    - _dx, _dy: Inverse grid spacing.
+
+    # Returns
+    - Nothing. Writes to dt_drain.
+"""
+@parallel_indices (ix, iy) function compute_draining_timestep!(
+    dt_drain,
+    F₁, G₁,
+    h,
+    dt,
+    _dx, _dy
+)
+    nx, ny = size(h)
+
+    if 2 <= ix <= nx-1 && 2 <= iy <= ny-1
+        out_x =
+            max(F₁[ix, iy], 0.0) +
+            max(-F₁[ix-1, iy], 0.0)
+
+        out_y =
+            max(G₁[ix, iy], 0.0) +
+            max(-G₁[ix, iy-1], 0.0)
+
+        drain_rate = out_x * _dx + out_y * _dy
+
+        if drain_rate > 0.0
+            dt_drain[ix, iy] = min(dt, h[ix, iy] / drain_rate)
+        else
+            dt_drain[ix, iy] = dt
+        end
+    end
+
+    return nothing
+end
+
+"""
+    compute_effective_flux_timesteps!(dtFx, dtGy, dt_drain, F₁, G₁, dt)
+
+    Compute face-wise effective timesteps using upwinded draining limits.
+
+    # Arguments
+    - dtFx, dtGy: Output arrays for x- and y-face timesteps.
+    - dt_drain: Cell-centered draining timesteps.
+    - F₁, G₁: Mass fluxes in x and y.
+    - dt: Global timestep.
+
+    # Returns
+    - Nothing. Writes to dtFx and dtGy.
+"""
+@parallel_indices (ix, iy) function compute_effective_flux_timesteps!(
+    dtFx, dtGy,
+    dt_drain,
+    F₁, G₁,
+    dt
+)
+    nxm1, ny = size(F₁)
+    nx, nym1 = size(G₁)
+
+    # x-faces
+    if ix <= nxm1 && iy <= ny
+        if F₁[ix, iy] > 0.0
+            dtFx[ix, iy] = min(dt, dt_drain[ix, iy])
+        elseif F₁[ix, iy] < 0.0
+            dtFx[ix, iy] = min(dt, dt_drain[ix+1, iy])
+        else
+            dtFx[ix, iy] = dt
+        end
+    end
+
+    # y-faces
+    if ix <= nx && iy <= nym1
+        if G₁[ix, iy] > 0.0
+            dtGy[ix, iy] = min(dt, dt_drain[ix, iy])
+        elseif G₁[ix, iy] < 0.0
+            dtGy[ix, iy] = min(dt, dt_drain[ix, iy+1])
+        else
+            dtGy[ix, iy] = dt
+        end
+    end
+
+    return nothing
+end
+
+"""
+    compute_1st_2nd_and_3th_flux!(F₁, F₂, F₃, G₁, G₂, G₃, hu, hv, h, z, g,
+                                 max_speed_x, max_speed_y, vel_eps)
+
+    Compute Rusanov fluxes for mass and momentum in both x and y directions.
+
+    # Arguments
+    - F₁, F₂, F₃: Fluxes on x-faces (mass, x-momentum, y-momentum).
+    - G₁, G₂, G₃: Fluxes on y-faces (mass, x-momentum, y-momentum).
+    - hu, hv, h: Momentum and depth fields.
+    - z: Bathymetry field.
+    - g: Gravity constant.
+    - max_speed_x, max_speed_y: Precomputed max wave speeds.
+    - vel_eps: Velocity regularization parameter.
+
+    # Returns
+    - Nothing. Writes to F* and G* arrays.
+"""
+@parallel_indices (ix, iy) function compute_1st_2nd_and_3th_flux!(
+    F₁, F₂, F₃,
+    G₁, G₂, G₃,
+    hu, hv, h, z, g,
+    max_speed_x, max_speed_y,
+    vel_eps
+)
+    nx, ny = size(h)
+
+    # -------------------------------------------------------------------------
+    # x-direction fluxes
+    # -------------------------------------------------------------------------
+    if ix <= nx - 1 && iy <= ny
+        hL = hx_L(h, z, ix, iy)
+        hR = hx_R(h, z, ix, iy)
+
+        ηL = eta(h, z, ix, iy)
+        ηR = eta(h, z, ix+1, iy)
+
+        uL = vel_u(h, hu, ix, iy, vel_eps)
+        uR = vel_u(h, hu, ix+1, iy, vel_eps)
+
+        vL = vel_v(h, hv, ix, iy, vel_eps)
+        vR = vel_v(h, hv, ix+1, iy, vel_eps)
+
+        # Reconstruct momenta consistently:
+        # momentum = reconstructed depth × cell velocity
+        huL = hL * uL
+        huR = hR * uR
+        hvL = hL * vL
+        hvR = hR * vR
+
+        ax = max_speed_x[ix, iy]
+
+        # Mass / free-surface flux
+        F₁[ix, iy] =
+            0.5 * (huL + huR) -
+            0.5 * ax * (ηR - ηL)
+
+        # x-momentum flux
+        F₂[ix, iy] =
+            0.5 * (
+                huL * uL + 0.5 * g * hL^2 +
+                huR * uR + 0.5 * g * hR^2
+            ) -
+            0.5 * ax * (huR - huL)
+
+        # y-momentum transported in x
+        F₃[ix, iy] =
+            0.5 * (
+                huL * vL +
+                huR * vR
+            ) -
+            0.5 * ax * (hvR - hvL)
+    end
+
+    # -------------------------------------------------------------------------
+    # y-direction fluxes
+    # -------------------------------------------------------------------------
+    if ix <= nx && iy <= ny - 1
+        hL = hy_L(h, z, ix, iy)
+        hR = hy_R(h, z, ix, iy)
+
+        ηL = eta(h, z, ix, iy)
+        ηR = eta(h, z, ix, iy+1)
+
+        uL = vel_u(h, hu, ix, iy, vel_eps)
+        uR = vel_u(h, hu, ix, iy+1, vel_eps)
+
+        vL = vel_v(h, hv, ix, iy, vel_eps)
+        vR = vel_v(h, hv, ix, iy+1, vel_eps)
+
+        huL = hL * uL
+        huR = hR * uR
+        hvL = hL * vL
+        hvR = hR * vR
+
+        ay = max_speed_y[ix, iy]
+
+        # Mass / free-surface flux
+        G₁[ix, iy] =
+            0.5 * (hvL + hvR) -
+            0.5 * ay * (ηR - ηL)
+
+        # x-momentum transported in y
+        G₂[ix, iy] =
+            0.5 * (
+                hvL * uL +
+                hvR * uR
+            ) -
+            0.5 * ay * (huR - huL)
+
+        # y-momentum flux
+        G₃[ix, iy] =
+            0.5 * (
+                hvL * vL + 0.5 * g * hL^2 +
+                hvR * vR + 0.5 * g * hR^2
+            ) -
+            0.5 * ay * (hvR - hvL)
+    end
+
+    return nothing
+end
+
+
+
+"""
+    update_height_momentum!(h, hu, hv, F₁, G₁, F₂, F₃, G₂, G₃, dtFx, dtGy,
+                            z, g, dt, _dx, _dy)
+
+    Update water depth and momentum using flux divergence and source terms.
+
+    # Arguments
+    - h, hu, hv: State arrays updated in place.
+    - F₁, G₁, F₂, F₃, G₂, G₃: Flux arrays.
+    - dtFx, dtGy: Face-wise timesteps for mass fluxes.
+    - z: Bathymetry field.
+    - g: Gravity constant.
+    - dt: Global timestep.
+    - _dx, _dy: Inverse grid spacing.
+
+    # Returns
+    - Nothing. Updates h, hu, hv in place.
+"""
+@parallel_indices (ix, iy) function update_height_momentum!(
+    h, hu, hv,
+    F₁, G₁, F₂, F₃, G₂, G₃, dtFx, dtGy,
+    z, g, dt, _dx, _dy
+)
+    nx, ny = size(h)
+
+    if 2 <= ix <= nx-1 && 2 <= iy <= ny-1
+        ηC = eta(h, z, ix, iy)
+
+        # ---------------------------------------------------------------------
+        # x-source term
+        # ---------------------------------------------------------------------
+        zE = 0.5 * (z[ix, iy] + z[ix+1, iy])
+        zW = 0.5 * (z[ix-1, iy] + z[ix, iy])
+
+        hE = max(0.0, ηC - zE)
+        hW = max(0.0, ηC - zW)
+
+        hsrc_x = 0.5 * (hE + hW)
+        dzdx_face = (zE - zW) * _dx
+
+        # ---------------------------------------------------------------------
+        # y-source term
+        # ---------------------------------------------------------------------
+        zN = 0.5 * (z[ix, iy] + z[ix, iy+1])
+        zS = 0.5 * (z[ix, iy-1] + z[ix, iy])
+
+        hN = max(0.0, ηC - zN)
+        hS = max(0.0, ηC - zS)
+
+        hsrc_y = 0.5 * (hN + hS)
+        dzdy_face = (zN - zS) * _dy
+
+        # ---------------------------------------------------------------------
+        # Momentum updates first
+        # ---------------------------------------------------------------------
+        hu[ix, iy] -= dt * (
+            dxb(F₂, ix, iy) * _dx +
+            dyb(G₂, ix, iy) * _dy +
+            g * hsrc_x * dzdx_face
+        )
+
+        hv[ix, iy] -= dt * (
+            dxb(F₃, ix, iy) * _dx +
+            dyb(G₃, ix, iy) * _dy +
+            g * hsrc_y * dzdy_face
+        )
+
+        # ---------------------------------------------------------------------
+        # Water-depth update
+        # Since z is stationary, h_t = η_t
+        # ---------------------------------------------------------------------
+        h[ix, iy] -= (
+            (F₁[ix, iy] * dtFx[ix, iy] -
+            F₁[ix-1, iy] * dtFx[ix-1, iy]) * _dx
+            +
+            (G₁[ix, iy] * dtGy[ix, iy] -
+            G₁[ix, iy-1] * dtGy[ix, iy-1]) * _dy
+        )
+
+    end
+
+    return nothing
+end
+
+"""
+    left_bc!(h, hu, hv, g, dt, _dx)
+
+    Apply the left-side radiative boundary condition.
+
+    # Arguments
+    - h, hu, hv: State arrays updated in place.
+    - g: Gravity constant.
+    - dt: Timestep.
+    - _dx: Inverse grid spacing in x.
+
+    # Returns
+    - Nothing. Updates the left boundary column.
+"""
+@parallel_indices (iy) function left_bc!(h, hu, hv, g, dt, _dx)
+    # Left boundary (ix=1)
+    cL = bc_speed_x(h, hu, 1, iy, g) * dt * _dx
+    αL = (cL - 1) / (cL + 1)
+
+    h1  = max(0.0, h[2, iy] + αL * (h[2, iy] - h[1, iy]))
+    hu1 = hu[2, iy] + αL * (hu[2, iy] - hu[1, iy])
+    hv1 = hv[2, iy] + αL * (hv[2, iy] - hv[1, iy])
+
+    if h1 <= h_eps
+        hu1 = 0.0
+        hv1 = 0.0
+    end
+
+    h[1, iy]    = h1
+    hu[1, iy]   = hu1
+    hv[1, iy]   = hv1
+
+    return nothing
+end
+
+"""
+    right_bc!(h, hu, hv, g, dt, _dx)
+
+    Apply the right-side radiative boundary condition.
+
+    # Arguments
+    - h, hu, hv: State arrays updated in place.
+    - g: Gravity constant.
+    - dt: Timestep.
+    - _dx: Inverse grid spacing in x.
+
+    # Returns
+    - Nothing. Updates the right boundary column.
+"""
+@parallel_indices (iy) function right_bc!(h, hu, hv, g, dt, _dx)
+    nx, ny = size(h)
+
+    # Right boundary (ix=nx)
+    cR = bc_speed_x(h, hu, nx, iy, g) * dt * _dx
+    αR = (cR - 1) / (cR + 1)
+
+    hR  = max(0.0, h[end-1, iy]  + αR * (h[end-1, iy]  - h[end, iy]))
+    huR = hu[end-1, iy] + αR * (hu[end-1, iy] - hu[end, iy])
+    hvR = hv[end-1, iy] + αR * (hv[end-1, iy] - hv[end, iy])
+
+    if hR <= h_eps
+        huR = 0.0
+        hvR = 0.0
+    end
+
+    h[end, iy]  = hR
+    hu[end, iy] = huR
+    hv[end, iy] = hvR
+    return nothing
+end
+
+"""
+    bottom_bc!(h, hu, hv, g, dt, _dy)
+
+    Apply the bottom-side radiative boundary condition.
+
+    # Arguments
+    - h, hu, hv: State arrays updated in place.
+    - g: Gravity constant.
+    - dt: Timestep.
+    - _dy: Inverse grid spacing in y.
+
+    # Returns
+    - Nothing. Updates the bottom boundary row.
+"""
+@parallel_indices (ix) function bottom_bc!(h, hu, hv, g, dt, _dy)
+    # Bottom boundary (iy=1)
+    cB = bc_speed_y(h, hv, ix, 1, g) * dt * _dy
+    αB = (cB - 1) / (cB + 1)
+
+    hB  = max(0.0, h[ix, 2]  + αB * (h[ix, 2]  - h[ix, 1]))
+    huB = hu[ix, 2] + αB * (hu[ix, 2] - hu[ix, 1])
+    hvB = hv[ix, 2] + αB * (hv[ix, 2] - hv[ix, 1])
+
+    if hB <= h_eps
+        huB = 0.0
+        hvB = 0.0
+    end
+
+    h[ix, 1]    = hB
+    hu[ix, 1]   = huB
+    hv[ix, 1]   = hvB
+    return nothing
+end
+
+"""
+    top_bc!(h, hu, hv, g, dt, _dy)
+
+    Apply the top-side radiative boundary condition.
+
+    # Arguments
+    - h, hu, hv: State arrays updated in place.
+    - g: Gravity constant.
+    - dt: Timestep.
+    - _dy: Inverse grid spacing in y.
+
+    # Returns
+    - Nothing. Updates the top boundary row.
+"""
+@parallel_indices (ix) function top_bc!(h, hu, hv, g, dt, _dy)
+    nx, ny = size(h)
+
+    # Top boundary (iy=ny)
+    cT = bc_speed_y(h, hv, ix, ny, g) * dt * _dy
+    αT = (cT - 1) / (cT + 1)
+
+    hT  = max(0.0, h[ix, end-1]  + αT * (h[ix, end-1]  - h[ix, end]))
+    huT = hu[ix, end-1] + αT * (hu[ix, end-1] - hu[ix, end])
+    hvT = hv[ix, end-1] + αT * (hv[ix, end-1] - hv[ix, end])
+
+    if hT <= h_eps
+        huT = 0.0
+        hvT = 0.0
+    end
+
+    h[ix, end]  = hT
+    hu[ix, end] = huT
+    hv[ix, end] = hvT
+    return nothing
+end
+
+"""
+    dry_cell_fix!(h, hu, hv, h_eps)
+
+    Clamp dry or invalid cells to zero depth and momentum.
+
+    # Arguments
+    - h, hu, hv: State arrays updated in place.
+    - h_eps: Dry-cell threshold.
+
+    # Returns
+    - Nothing. Updates h, hu, hv in place.
+"""
+@parallel_indices (ix, iy) function dry_cell_fix!(h, hu, hv, h_eps)
+    nx, ny = size(h)
+
+    if ix <= nx && iy <= ny
+        if !isfinite(h[ix, iy]) || h[ix, iy] <= h_eps
+            h[ix, iy]  = 0.0
+            hu[ix, iy] = 0.0
+            hv[ix, iy] = 0.0
+        elseif !isfinite(hu[ix, iy]) || !isfinite(hv[ix, iy])
+            hu[ix, iy] = 0.0
+            hv[ix, iy] = 0.0
+        end
+    end
+
+    return nothing
+end
+
+# -----------------------------------------------------------------------------
+# Main
+# -----------------------------------------------------------------------------
+
+"""
+    run_baseline(nx_global, ny_global; nt=20, outdir="frames",
+                 do_viz=false, benchmark=false)
+
+Run the simple 2D SWE baseline with IGG domain decomposition.
+"""
+
+@views function get_global_indices(nx, ny, coords)
+    # DIFF manual/baseline: manual replacement for IGG's x_g/y_g global-index
+    # mapping. These ranges include halo cells, so neighboring ranks overlap by
+    # one cell exactly where halos live.
+    nx_local = nx - 2
+    ny_local = ny - 2
+
+    # Halo-inclusive global indices. Neighboring ranks overlap by one cell.
+    ix_start = coords[1] * nx_local + 1
+    iy_start = coords[2] * ny_local + 1
+
+    ix_end = ix_start + nx - 1
+    iy_end = iy_start + ny - 1
+
+    return (ix_start:ix_end, iy_start:iy_end)
+end
+
+@views function x_g(ix, dx)
+    return (ix - 1) * dx
+end
+
+@views function y_g(iy, dy)
+    return (iy - 1) * dy
+end
+
+function update_halo_scalar!(A, comm_cart, neighbors_x, neighbors_y, tag_base)
+    # DIFF manual/baseline: manual replacement for IGG update_halo!. This is a
+    # blocking Sendrecv halo exchange, not hidden/overlapped communication.
+    left, right = neighbors_x
+    bottom, top = neighbors_y
+
+    send_left = copy(A[2, :])
+    recv_right = similar(send_left)
+    MPI.Sendrecv!(send_left, left, tag_base,
+                  recv_right, right, tag_base,
+                  comm_cart)
+    if right != MPI.PROC_NULL
+        A[end, :] .= recv_right
+    end
+
+    send_right = copy(A[end-1, :])
+    recv_left = similar(send_right)
+    MPI.Sendrecv!(send_right, right, tag_base + 1,
+                  recv_left, left, tag_base + 1,
+                  comm_cart)
+    if left != MPI.PROC_NULL
+        A[1, :] .= recv_left
+    end
+
+    send_bottom = copy(A[:, 2])
+    recv_top = similar(send_bottom)
+    MPI.Sendrecv!(send_bottom, bottom, tag_base + 2,
+                  recv_top, top, tag_base + 2,
+                  comm_cart)
+    if top != MPI.PROC_NULL
+        A[:, end] .= recv_top
+    end
+
+    send_top = copy(A[:, end-1])
+    recv_bottom = similar(send_top)
+    MPI.Sendrecv!(send_top, top, tag_base + 3,
+                  recv_bottom, bottom, tag_base + 3,
+                  comm_cart)
+    if bottom != MPI.PROC_NULL
+        A[:, 1] .= recv_bottom
+    end
+
+    return nothing
+end
+
+function update_halo!(h, hu, hv, comm_cart, neighbors_x, neighbors_y)
+    # DIFF manual/baseline: baseline.jl calls update_halo!(h, hu, hv) from IGG.
+    # Here we exchange each field explicitly and pass communicator/neighbors.
+    update_halo_scalar!(h, comm_cart, neighbors_x, neighbors_y, 0)
+    update_halo_scalar!(hu, comm_cart, neighbors_x, neighbors_y, 10)
+    update_halo_scalar!(hv, comm_cart, neighbors_x, neighbors_y, 20)
+
+    return nothing
+end
+
+function update_halo_dt_drain!(dt_drain, comm_cart, neighbors_x, neighbors_y)
+    # DIFF manual/baseline: scalar dt_drain halo update implemented explicitly;
+    # baseline.jl uses IGG's update_halo!(dt_drain).
+    update_halo_scalar!(dt_drain, comm_cart, neighbors_x, neighbors_y, 30)
+    return nothing
+end
+
+@views function run_baseline(nx_global, ny_global;
+            nt=20,
+            outdir="frames",
+            do_viz=false,
+            benchmark=false)
+    lx = 50.0
+    ly = 50.0
+
+    # Choose 2D MPI topology.
+    dims_mpi = [1, 4]
+
+    if (nx_global - 2) % dims_mpi[1] != 0 || (ny_global - 2) % dims_mpi[2] != 0
+        error("nx_global-2 and ny_global-2 must be divisible by the MPI topology.")
+    end
+
+    # Choose local domain size including halos.
+    nx = div(nx_global - 2, dims_mpi[1]) + 2
+    ny = div(ny_global - 2, dims_mpi[2]) + 2
+
+    # DIFF manual/baseline: manual.jl owns MPI setup directly. baseline.jl lets
+    # IGG's init_global_grid(...) create and manage the Cartesian grid.
+    owns_mpi = !MPI.Initialized()
+    if owns_mpi
+        MPI.Init()
+    end
+    nprocs = MPI.Comm_size(MPI.COMM_WORLD)
+    if nprocs != prod(dims_mpi)
+        error("manual.jl currently expects exactly $(prod(dims_mpi)) MPI ranks for a $(dims_mpi[1])x$(dims_mpi[2]) topology, got $nprocs.")
+    end
+    # DIFF manual/baseline: explicit Cartesian communicator creation. This is
+    # hidden inside init_global_grid(...) in baseline.jl.
+    comm_cart = MPI.Cart_create(MPI.COMM_WORLD, dims_mpi; periodic=(false, false), reorder=false)
+    me = MPI.Comm_rank(comm_cart)
+    dims, periods, coords = MPI.Cart_get(comm_cart)
+
+    # DIFF manual/baseline: explicit neighbor lookup. baseline.jl only needs
+    # coords from IGG and calls IGG's update_halo! later.
+    neighbors_x = MPI.Cart_shift(comm_cart, 0, 1) 
+    neighbors_y = MPI.Cart_shift(comm_cart, 1, 1)
+
+    # DIFF manual/baseline: physical-boundary ranks are detected from missing
+    # Cartesian neighbors. baseline.jl checks coords against dims.
+    is_left   = neighbors_x[1] == MPI.PROC_NULL
+    is_right  = neighbors_x[2] == MPI.PROC_NULL
+    is_bottom = neighbors_y[1] == MPI.PROC_NULL
+    is_top    = neighbors_y[2] == MPI.PROC_NULL
+
+    b_width     = (8, 8, 0)
+
+    if me == 0 && !benchmark
+        println("Global domain size (including halos): ", nx_global, " x ", ny_global)
+        println("MPI topology: ", dims_mpi[1], " x ", dims_mpi[2])
+        println("Local domain size (including halos): ", nx, " x ", ny)
+        println("Time steps: ", nt)
+    end
+
+    nvis = 5
+
+    # DIFF manual/baseline: no IGG nx_g()/ny_g() helpers here; use the explicit
+    # input global sizes.
+    dx = lx / (nx_global - 1)
+    dy = ly / (ny_global - 1)
+    vel_eps = min(dx, dy)^4
+    _dx  = 1.0 / dx
+    _dy  = 1.0 / dy
+
+    h  = @zeros(nx, ny)
+    hu = @zeros(nx, ny)
+    hv = @zeros(nx, ny)
+
+    ix_roi = 2:(nx_global - 1)
+    iy_roi = 2:(ny_global - 1)
+
+    if !benchmark
+        save_domain_decomposition!(outdir;
+            me = me,
+            dims = dims,
+            nprocs = nprocs,
+            nx = nx,
+            ny = ny,
+            nx_global = nx_global,
+            ny_global = ny_global,
+            nx_field = nx_global - 2,
+            ny_field = ny_global - 2,
+            lx = lx,
+            ly = ly,
+            dx = dx,
+            dy = dy,
+            comm_cart = comm_cart,
+            ix_roi = ix_roi,
+            iy_roi = iy_roi,
+        )
+    end
+
+
+    # DIFF manual/baseline: build halo-inclusive coordinate arrays manually.
+    # baseline.jl uses IGG's x_g/y_g mapping directly.
+    ix_g, iy_g = get_global_indices(nx, ny, coords)
+    xs = [x_g(ix, dx) - lx / 2 for ix in ix_g]
+    ys = [y_g(iy, dy) - ly / 2 for iy in iy_g]
+
+    # fluxes
+    F₁ = @zeros(nx - 1, ny)
+    F₂ = @zeros(nx - 1, ny)
+    F₃ = @zeros(nx - 1, ny)
+
+    G₁ = @zeros(nx, ny - 1)
+    G₂ = @zeros(nx, ny - 1)
+    G₃ = @zeros(nx, ny - 1)
+
+    max_speed_x = @zeros(nx - 1, ny)
+    max_speed_y = @zeros(nx, ny - 1)
+
+    z_local  = zeros(nx, ny)
+    η0_local = zeros(nx, ny)
+
+    h_base = 15.0
+    bump_amplitude = 2.0
+    bump_width = max(lx, ly) / 12
+
+    for i in 1:nx
+        for j in 1:ny
+            x = xs[i]
+            y = ys[j]
+
+            z_local[i, j] = 0.0
+            η0_local[i, j] = h_base + bump_amplitude * exp(-(x^2 + y^2) / (2 * bump_width^2))
+        end
+    end
+
+    z  = Data.Array(z_local)
+    η0 = Data.Array(η0_local)
+
+    hmin  = 1e-2
+    h .= max.(0.0, η0 .- z)
+
+    dt_drain = @zeros(nx, ny)
+
+    dtFx = @zeros(nx - 1, ny)
+    dtGy = @zeros(nx, ny - 1)
+    
+    time = 0.0
+
+    # -------------------------------------------------------------------------
+    # visualization
+    # -------------------------------------------------------------------------
+
+    if do_viz && !benchmark
+        if me == 0
+            println("Using visualization: Array output")
+        end
+        mkpath(outdir)
+        
+        nx_v, ny_v = (nx - 2) * dims[1], (ny - 2) * dims[2]
+        h_v = zeros(nx_v, ny_v)
+        z_v = zeros(nx_v, ny_v)
+        h_inn = zeros(nx - 2, ny - 2)
+        z_inn = zeros(nx - 2, ny - 2)
+        h_inn .= Array(h)[2:end-1, 2:end-1]; gather_global_array_manual!(h_inn, h_v, comm_cart)
+        z_inn .= Array(z)[2:end-1, 2:end-1]; gather_global_array_manual!(z_inn, z_v, comm_cart)
+
+        if me == 0
+            frame_id = Ref(0)
+            @info "Saving arrays to $outdir"
+            function save_array!()
+                frame_id[] += 1
+                fname = joinpath(outdir, @sprintf("array_frame_%06d.jls", frame_id[]))
+                serialize(fname, (h=Array(convert.(Float32, h_v)),))
+            end
+            function save_array_with_z!()
+                frame_id[] += 1
+                fname = joinpath(outdir, @sprintf("array_frame_%06d.jls", frame_id[]))
+                serialize(fname, (h=Array(convert.(Float32, h_v)), z=Array(convert.(Float32, z_v))))
+            end
+            save_array_with_z!()
+        end
+    end
+
+    # -------------------------------------------------------------------------
+    # main loop
+    # -------------------------------------------------------------------------
+
+    dt = 0.0
+    loop_walltime = 0.0
+
+    @synchronize()
+    MPI.Barrier(comm_cart)
+    loop_t0 = time_ns()
+
+    for it in 1:nt
+        @parallel compute_maxspeed!(max_speed_x, max_speed_y, h, hu, hv, z, g, vel_eps)
+        
+        if !benchmark && 0.99 / (maximum(max_speed_x) * _dx + maximum(max_speed_y) * _dy) < dt 
+            println("Warning: Local dt = ", 0.99 / (maximum(max_speed_x) * _dx + maximum(max_speed_y) * _dy), " is bigger than the current CLF, at iteration ", it)
+        end
+
+        if it % 10 == 0 || it == 1
+            # DIFF manual/baseline: same global reduction idea, but manual.jl
+            # passes comm_cart explicitly. baseline.jl uses MPI.COMM_WORLD in
+            # its min_g/max_g helpers after IGG setup.
+            dt =  0.9 / (max_g(max_speed_x, comm_cart) * _dx + max_g(max_speed_y, comm_cart) * _dy)
+        end
+
+        time += dt
+
+        if !isfinite(dt)
+            error("Non-finite dt at iteration $it: dt=$dt, max_sx=$(maximum(max_speed_x)), max_sy=$(maximum(max_speed_y))")
+        end
+
+        @parallel compute_1st_2nd_and_3th_flux!(
+            F₁, F₂, F₃,
+            G₁, G₂, G₃,
+            hu, hv, h, z, g,
+            max_speed_x, max_speed_y, vel_eps
+        )
+
+        @parallel compute_draining_timestep!(
+            dt_drain,
+            F₁, G₁,
+            h,
+            dt,
+            _dx, _dy
+        )
+        # DIFF manual/baseline: explicit scalar halo update with Sendrecv.
+        # baseline.jl calls IGG update_halo!(dt_drain).
+        update_halo_dt_drain!(dt_drain, comm_cart, neighbors_x, neighbors_y)
+
+        
+        @parallel compute_effective_flux_timesteps!(
+            dtFx, dtGy,
+            dt_drain,
+            F₁, G₁,
+            dt
+        )
+        
+
+        @parallel update_height_momentum!(
+            h, hu, hv,
+            F₁, G₁, F₂, F₃, G₂, G₃, dtFx, dtGy,
+            z, g, dt, _dx, _dy
+        )           
+        # DIFF manual/baseline: explicit h/hu/hv halo exchange. This is
+        # blocking communication; no hidden/overlapped communication yet.
+        update_halo!(h, hu, hv, comm_cart, neighbors_x, neighbors_y)
+
+
+        @parallel dry_cell_fix!(h, hu, hv, hmin)
+
+        # Apply BCs only on ranks that border the global domain boundaries
+        if is_left
+            @parallel (1:ny) left_bc!(h, hu, hv, g, dt, _dx)
+        end
+
+        if is_right
+            @parallel (1:ny) right_bc!(h, hu, hv, g, dt, _dx)
+        end
+
+        if is_bottom
+            @parallel (1:nx) bottom_bc!(h, hu, hv, g, dt, _dy)
+        end
+
+        if is_top
+            @parallel (1:nx) top_bc!(h, hu, hv, g, dt, _dy)
+        end
+        
+        @parallel dry_cell_fix!(h, hu, hv, hmin)
+
+        if do_viz && !benchmark && it % nvis == 0
+
+            # DIFF manual/baseline: output gather uses manual MPI.Gatherv!.
+            # baseline.jl calls IGG gather! here.
+            h_inn .= Array(h)[2:end-1, 2:end-1]; gather_global_array_manual!(h_inn, h_v, comm_cart)
+            z_inn .= Array(z)[2:end-1, 2:end-1]; gather_global_array_manual!(z_inn, z_v, comm_cart)
+
+            if me == 0
+                save_array!()
+            end
+        end
+        
+        if me == 0 && !benchmark
+            percent = 100 * it / nt
+            print("\rProgress: $(round(percent, digits=1)) %")
+            flush(stdout)
+        end
+    end
+
+    @synchronize()
+    loop_walltime = MPI.Allreduce((time_ns() - loop_t0) * 1e-9, MPI.MAX, comm_cart)
+
+    if benchmark
+        if me == 0
+            cells_per_step = nx_global * ny_global
+            cell_updates_per_second = cells_per_step * nt / loop_walltime
+            println(
+                "BENCHMARK ",
+                "walltime_seconds=", @sprintf("%.9f", loop_walltime), " ",
+                "nt=", nt, " ",
+                "global_size=", nx_global, "x", ny_global, " ",
+                "local_size=", nx, "x", ny, " ",
+                "nprocs=", nprocs, " ",
+                "steps_per_second=", @sprintf("%.6f", nt / loop_walltime), " ",
+                "cell_updates_per_second=", @sprintf("%.6e", cell_updates_per_second)
+            )
+        end
+
+        # DIFF manual/baseline: finalize MPI only if this function initialized
+        # it. baseline.jl calls IGG finalize_global_grid().
+        if owns_mpi
+            MPI.Finalize()
+        end
+        return loop_walltime
+    end
+
+    if me == 0
+        println("\nSimulation completed.")
+        println("Total simulation time: $(round(time, digits=2)) seconds")
+
+        if do_viz
+            println("\nSaved $(frame_id[]) frames to: $(abspath(outdir))")
+        end
+    end
+
+    # DIFF manual/baseline: finalize MPI only if this function initialized it.
+    # baseline.jl calls IGG finalize_global_grid().
+    if owns_mpi
+        MPI.Finalize()
+    end
+    return loop_walltime
+
+end
+
+function main()
+    input_nx = 402
+    input_ny = 402
+    input_nt = 20
+    input_outdir = "docs/frames/baseline"
+    input_do_viz = true
+    input_benchmark = false
+
+    for i in 1:length(ARGS)
+        if ARGS[i] == "--nx"
+            input_nx = parse(Int, ARGS[i+1])
+        elseif ARGS[i] == "--ny"
+            input_ny = parse(Int, ARGS[i+1])
+        elseif ARGS[i] == "--nt"
+            input_nt = parse(Int, ARGS[i+1])
+        elseif ARGS[i] == "--outdir"
+            input_outdir = ARGS[i+1]
+        elseif ARGS[i] == "--viz"
+            input_do_viz = true
+        elseif ARGS[i] == "--benchmark"
+            input_benchmark = true
+        end
+    end
+
+    run_baseline(input_nx, input_ny; nt=input_nt,
+        outdir = input_outdir,
+        do_viz = input_do_viz && !input_benchmark,
+        benchmark = input_benchmark
+    )
+end
+
+if abspath(PROGRAM_FILE) == @__FILE__
+    main()
+end

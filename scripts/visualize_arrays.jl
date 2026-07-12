@@ -2,7 +2,7 @@ using Serialization
 using Printf
 using CairoMakie
 
-input_dir = "docs/frames/frames_topography_multi"
+input_dir = "docs/frames/baseline"
 output_dir = joinpath(input_dir, "plots")
 
 for i in 1:length(ARGS)

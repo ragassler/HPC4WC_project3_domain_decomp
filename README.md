@@ -1,120 +1,216 @@
 # HPC4WC Project 3: Domain Decomposition SWE
 
-Small 2D shallow-water-equation solver using `ParallelStencil`, MPI, and
-`ImplicitGlobalGrid` for domain decomposition.
+Small 2D shallow-water-equation solver used to study domain decomposition and
+MPI halo exchange. The project currently contains two main solver variants:
 
-## Baseline Provenance
+- `src/baseline.jl`: baseline implementation using `ImplicitGlobalGrid.jl`.
+- `src/manual.jl`: manual MPI Cartesian-domain-decomposition version without
+  `ImplicitGlobalGrid.jl`.
 
-The baseline solver in `src/baseline.jl` is adapted from the multi-XPU solver
-`src/xpu/2d_swe_multi_xpu_wb.jl` of
+Both versions use `ParallelStencil` kernels and currently run on the CPU
+backend (`Threads`). `USE_GPU` is set to `false` in the solver files.
+
+## Provenance
+
+The numerical solver is adapted from the SWE project reference implementation
+`src/xpu/2d_swe_multi_xpu_wb.jl` in
 [S1ntax3rror/ShallowWater4PDEonGPU](https://github.com/S1ntax3rror/ShallowWater4PDEonGPU).
-Domain decomposition uses
-[ImplicitGlobalGrid.jl](https://github.com/eth-cscs/ImplicitGlobalGrid.jl).
+
+This repository has been simplified for the HPC4WC domain-decomposition project:
+
+- Uses one simple Gaussian free-surface perturbation as initial condition.
+- Uses flat bathymetry (`z = 0`) only.
+- Removes topography loading and related data preprocessing.
+- Removes the expansion-factor/topography experiment code.
+- Removes GPU memory-workaround/test code from the reference solver.
+- Keeps array-output visualization instead of plotting from inside the solver.
+- Adds benchmark mode that times only the main simulation loop.
+- Adds saved domain-decomposition metadata for external plotting.
+- Keeps communication simple: there is currently **no hidden/overlapped
+  communication**. The manual version uses blocking halo exchange. Overlap can
+  be added later as a separate optimization.
 
 ## Setup
 
-Install the Julia environment once:
+Instantiate the Julia environment once:
 
 ```bash
 julia --project -e 'using Pkg; Pkg.instantiate()'
 ```
 
-The main solver is:
+If the system `mpiexec` does not match the MPI used by `MPI.jl`, use:
+
+```bash
+julia --project -e 'using MPI; println(MPI.mpiexec())'
+```
+
+and launch through `MPI.mpiexec()` as shown below.
+
+## Solver Options
+
+Both `src/baseline.jl` and `src/manual.jl` accept the same command-line options:
 
 ```text
-src/baseline.jl
+--nx N          Global x size including outer halos/default boundary cells
+--ny N          Global y size including outer halos/default boundary cells
+--nt N          Number of timesteps
+--outdir DIR    Directory for saved arrays and domain-decomposition metadata
+--viz           Save serialized field arrays for later plotting
+--benchmark     Run timing mode: no saved arrays, no progress output
 ```
 
-## Run Locally
+Current script defaults:
 
-The current code fixes the MPI topology to `2 x 2`, so run with 4 ranks:
+```text
+baseline.jl: --nx 400 --ny 400 --nt 20 --outdir docs/frames/baseline
+manual.jl:   --nx 100 --ny 400 --nt 20 --outdir docs/frames/baseline
+```
+
+`baseline.jl` lets `ImplicitGlobalGrid.jl`/MPI choose a compact Cartesian
+topology from the number of MPI ranks. `manual.jl` is still fixed to `2 x 2`,
+so manual runs must use 4 MPI ranks. In both cases, the global interior size
+`nx - 2` by `ny - 2` must be divisible by the chosen topology.
+
+## Run Baseline
+
+`baseline.jl` uses `ImplicitGlobalGrid.jl` for the Cartesian decomposition,
+global indices, and halo updates. The topology is selected automatically from
+the number of MPI ranks.
 
 ```bash
-mpiexec -n 4 julia --project src/baseline.jl
+mpiexec -n 4 julia --project src/baseline.jl --nx 100 --ny 400 --nt 20
 ```
 
-If the system `mpiexec` does not match `MPI.jl`, use the launcher selected by
-the Julia environment:
+Equivalent launch using the MPI selected by the Julia environment:
 
 ```bash
-julia --project -e 'using MPI; run(`$(MPI.mpiexec()) -n 4 julia --project src/baseline.jl`)'
+julia --project -e 'using MPI; run(`$(MPI.mpiexec()) -n 4 julia --project src/baseline.jl --nx 100 --ny 400 --nt 20`)'
 ```
 
-Optional global grid arguments:
+Benchmark mode:
 
 ```bash
-mpiexec -n 4 julia --project src/baseline.jl --nx 500 --ny 500
+mpiexec -n 4 julia --project src/baseline.jl --nx 500 --ny 500 --nt 100 --benchmark
 ```
 
-Quick verification run with serialized visualization arrays:
+Benchmark output is a single line from rank 0:
+
+```text
+BENCHMARK walltime_seconds=... nt=... global_size=... local_size=... nprocs=... steps_per_second=... cell_updates_per_second=...
+```
+
+## Run Manual MPI Version
+
+`manual.jl` removes `ImplicitGlobalGrid.jl` and implements the Cartesian
+communicator, global indexing, gather, and halo exchange manually with `MPI.jl`.
 
 ```bash
-julia --project -e 'using MPI; run(`$(MPI.mpiexec()) -n 4 julia --project src/baseline.jl --nx 80 --ny 80 --nt 20 --viz --outdir docs/frames/simple_ic`)'
-julia --project scripts/visualize_arrays.jl --input docs/frames/simple_ic --output docs/frames/simple_ic/plots
+mpiexec -n 4 julia --project src/manual.jl --nx 100 --ny 400 --nt 20
 ```
 
-The script currently calls `swe2d_topography_frames(...; nt=2000, do_viz=false)`,
-so it runs a benchmark-style simulation and does not write frames by default.
-
-## Run With Slurm
-
-Submit the provided 4-rank job:
+Benchmark mode:
 
 ```bash
-mkdir -p out
-sbatch run_files/run_2D_swe_multi_xpu_wb.sh
+mpiexec -n 4 julia --project src/manual.jl --nx 500 --ny 500 --nt 100 --benchmark
 ```
 
-There is also a weak-scaling helper:
+Current limitations of `manual.jl`:
+
+- Fixed `2 x 2` decomposition, therefore exactly 4 MPI ranks.
+- Uniform local block sizes only.
+- Blocking halo exchange only; no hidden communication yet.
+- CPU backend only unless `USE_GPU` and the communication path are extended.
+
+## Save And Plot Field Arrays
+
+Use `--viz` to save serialized arrays in `--outdir`. The solver writes files
+named `array_frame_*.jls`. Plot them afterwards with:
 
 ```bash
-bash run_files/weak_scaling.sh
+mpiexec -n 4 julia --project src/baseline.jl --nx 80 --ny 80 --nt 20 --viz --outdir docs/frames/baseline
+julia --project scripts/visualize_arrays.jl --input docs/frames/baseline --output docs/frames/baseline/plots
 ```
 
-Note: the current solver source fixes `dims_mpi = [2, 2]`, so only 4-task
-runs work without changing the topology in `src/baseline.jl`.
-
-The Slurm scripts use CSCS-style Julia uenv commands and set:
+The same workflow works for `src/manual.jl`:
 
 ```bash
-MPICH_GPU_SUPPORT_ENABLED=1
-IGG_CUDAAWARE_MPI=1
-JULIA_CUDA_USE_COMPAT=false
+mpiexec -n 4 julia --project src/manual.jl --nx 80 --ny 80 --nt 20 --viz --outdir docs/frames/manual
+julia --project scripts/visualize_arrays.jl --input docs/frames/manual --output docs/frames/manual/plots
 ```
 
-Adjust the account, uenv, number of tasks, and topology if running on a
-different cluster.
+`scripts/visualize_arrays.jl` options:
 
-## Domain Decomposition Baseline
-
-`ImplicitGlobalGrid` creates a Cartesian MPI grid from local array sizes. In
-this code:
-
-```julia
-dims_mpi = [2, 2]
-nx = round(Int, (nx_global - 2) / dims_mpi[1]) + 2
-ny = round(Int, (ny_global - 2) / dims_mpi[2]) + 2
-
-me, dims, nprocs, coords, comm_cart = init_global_grid(
-    nx, ny, 1;
-    dimx=dims_mpi[1], dimy=dims_mpi[2], dimz=1,
-    init_MPI=false,
-    select_device=false,
-)
+```text
+--input DIR      Directory containing array_frame_*.jls
+--output DIR     Directory where PNG plots are written
 ```
 
-Each rank owns one local block with halo cells. The global size is recovered
-with `nx_g()` and `ny_g()`, global coordinates use `x_g(...)` and `y_g(...)`,
-and halo exchange is done with `update_halo!(...)`. Boundary conditions are
-only applied on ranks whose `coords` touch the outer global boundary.
+## Plot Domain Decomposition
+
+Normal non-benchmark runs save domain-decomposition metadata to:
+
+```text
+OUTDIR/domain_decomposition.jls
+```
+
+Plot it with:
+
+```bash
+julia --project scripts/visualize_domain_decomposition.jl --input docs/frames/manual --output docs/frames/manual/domain_decomposition.png
+```
+
+`scripts/visualize_domain_decomposition.jl` options:
+
+```text
+--input PATH     Either an output directory or a domain_decomposition.jls file
+--output PATH    Output PNG path
+--no-roi         Do not draw the saved region-of-interest outline
+```
+
+## Slurm / Cluster Runs
+
+For batch systems, use the same command inside the job script:
+
+```bash
+mpiexec -n 4 julia --project src/baseline.jl --nx 500 --ny 500 --nt 100 --benchmark
+```
+
+or:
+
+```bash
+mpiexec -n 4 julia --project src/manual.jl --nx 500 --ny 500 --nt 100 --benchmark
+```
+
+The repository also contains helper scripts in `run_files/`, but check them
+before submitting because cluster account, module/uenv setup, number of tasks,
+and GPU-related environment variables are machine-specific. The current solver
+files are configured for CPU runs.
+
+## Implementation Notes
+
+`baseline.jl`:
+
+- Uses `init_global_grid(...)` from `ImplicitGlobalGrid.jl`.
+- Uses IGG helpers such as global indexing and `update_halo!`.
+- Gathers field arrays and domain-decomposition metadata for external plotting.
+
+`manual.jl`:
+
+- Creates an MPI Cartesian communicator with `MPI.Cart_create`.
+- Uses `MPI.Cart_shift` to find neighbors.
+- Uses `MPI.Gatherv!` to gather local interiors to rank 0.
+- Uses blocking `MPI.Sendrecv!` halo updates.
+- Applies physical boundary conditions only on ranks at global boundaries.
+
+Future work:
+
+- Make the topology configurable, for example `1x4`, `4x1`, or arbitrary
+  `px x py`.
+- Add nonblocking halo exchange and overlap with interior computation.
+- Re-enable/validate GPU execution once the manual communication path is ready.
+- Add comparison checks between `baseline.jl` and `manual.jl`.
 
 ## References
 
 1. [S1ntax3rror/ShallowWater4PDEonGPU](https://github.com/S1ntax3rror/ShallowWater4PDEonGPU)
 2. [eth-cscs/ImplicitGlobalGrid.jl](https://github.com/eth-cscs/ImplicitGlobalGrid.jl)
-
-TODO:
-- look that it works on cpu and gpu somehow
-- benchmark suite,
-- decomposition of domain plotting
-

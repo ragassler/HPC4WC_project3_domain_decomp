@@ -1,11 +1,9 @@
 using Serialization
 
-using StaticArrays
-using Random
-
 using ImplicitGlobalGrid
 import MPI
 
+const CLI_BENCHMARK_MODE = "--benchmark" in ARGS
 const USE_GPU = false
 using ParallelStencil
 using ParallelStencil.FiniteDifferences2D
@@ -15,183 +13,184 @@ import ParallelStencil: @reset_parallel_stencil
     @init_parallel_stencil(CUDA, Float64, 2, inbounds=false)
 else
     @init_parallel_stencil(Threads, Float64, 2, inbounds=false)
-    @info "threads" Threads.nthreads()
+    if !CLI_BENCHMARK_MODE
+        @info "threads" Threads.nthreads()
+    end
 end
 
 using Printf
 
-nt_nx_multiplier = 2 # no const on purpose
 const h_eps = 1e-2
 
 """
     avx_comp(hv1, hv2, h, ix, iy)
 
-Compute the x-face average of hv1*hv2/h between cells (ix,iy) and (ix+1,iy).
+    Compute the x-face average of hv1*hv2/h between cells (ix,iy) and (ix+1,iy).
 
-# Arguments
-- hv1, hv2: Momentum-like arrays.
-- h: Water-depth array.
-- ix, iy: Cell indices.
+    # Arguments
+    - hv1, hv2: Momentum-like arrays.
+    - h: Water-depth array.
+    - ix, iy: Cell indices.
 
-# Returns
-- Scalar face-averaged value in x.
+    # Returns
+    - Scalar face-averaged value in x.
 """
 @inline avx_comp(hv1, hv2, h, ix, iy) = 0.5 * (hv1[ix, iy] * hv2[ix, iy] / h[ix, iy] + hv1[ix+1, iy] * hv2[ix+1, iy] / h[ix+1, iy])
 
 """
     avy_comp(hv1, hv2, h, ix, iy)
 
-Compute the y-face average of hv1*hv2/h between cells (ix,iy) and (ix,iy+1).
+    Compute the y-face average of hv1*hv2/h between cells (ix,iy) and (ix,iy+1).
 
-# Arguments
-- hv1, hv2: Momentum-like arrays.
-- h: Water-depth array.
-- ix, iy: Cell indices.
+    # Arguments
+    - hv1, hv2: Momentum-like arrays.
+    - h: Water-depth array.
+    - ix, iy: Cell indices.
 
-# Returns
-- Scalar face-averaged value in y.
+    # Returns
+    - Scalar face-averaged value in y.
 """
 @inline avy_comp(hv1, hv2, h, ix, iy) = 0.5 * (hv1[ix, iy] * hv2[ix, iy] / h[ix, iy] + hv1[ix, iy+1] * hv2[ix, iy+1] / h[ix, iy+1])
 
 """
-    avx_simp(h, ix, iy)
+        avx_simp(h, ix, iy)
 
-Compute the simple x-face average of h^2 between cells (ix,iy) and (ix+1,iy).
+    Compute the simple x-face average of h^2 between cells (ix,iy) and (ix+1,iy).
 
-# Arguments
-- h: Water-depth array.
-- ix, iy: Cell indices.
+    # Arguments
+    - h: Water-depth array.
+    - ix, iy: Cell indices.
 
-# Returns
-- Scalar average of squared depth in x.
+    # Returns
+    - Scalar average of squared depth in x.
 """
 @inline avx_simp(h, ix, iy) = 0.5 * (h[ix, iy] * h[ix, iy] + h[ix+1, iy] * h[ix+1, iy])
 
 """
     avy_simp(h, ix, iy)
 
-Compute the simple y-face average of h^2 between cells (ix,iy) and (ix,iy+1).
+    Compute the simple y-face average of h^2 between cells (ix,iy) and (ix,iy+1).
 
-# Arguments
-- h: Water-depth array.
-- ix, iy: Cell indices.
+    # Arguments
+    - h: Water-depth array.
+    - ix, iy: Cell indices.
 
-# Returns
-- Scalar average of squared depth in y.
+    # Returns
+    - Scalar average of squared depth in y.
 """
 @inline avy_simp(h, ix, iy) = 0.5 * (h[ix, iy] * h[ix, iy] + h[ix, iy+1] * h[ix, iy+1])
 
 """
     dxa(h, ix, iy)
 
-Forward difference in x at cell (ix,iy).
+    Forward difference in x at cell (ix,iy).
 
-# Arguments
-- h: Input array.
-- ix, iy: Cell indices.
+    # Arguments
+    - h: Input array.
+    - ix, iy: Cell indices.
 
-# Returns
-- h[ix+1,iy] - h[ix,iy].
+    # Returns
+    - h[ix+1,iy] - h[ix,iy].
 """
 @inline dxa(h, ix, iy) = h[ix+1, iy] - h[ix, iy]
 
 """
     dya(h, ix, iy)
 
-Forward difference in y at cell (ix,iy).
+    Forward difference in y at cell (ix,iy).
 
-# Arguments
-- h: Input array.
-- ix, iy: Cell indices.
+    # Arguments
+    - h: Input array.
+    - ix, iy: Cell indices.
 
-# Returns
-- h[ix,iy+1] - h[ix,iy].
+    # Returns
+    - h[ix,iy+1] - h[ix,iy].
 """
 @inline dya(h, ix, iy) = h[ix, iy+1] - h[ix, iy]
 
 """
     dxb(h, ix, iy)
 
-Backward difference in x at cell (ix,iy).
+    Backward difference in x at cell (ix,iy).
 
-# Arguments
-- h: Input array.
-- ix, iy: Cell indices.
+    # Arguments
+    - h: Input array.
+    - ix, iy: Cell indices.
 
-# Returns
-- h[ix,iy] - h[ix-1,iy].
+    # Returns
+    - h[ix,iy] - h[ix-1,iy].
 """
 @inline dxb(h, ix, iy) = h[ix, iy] - h[ix-1, iy]
 
 """
     dyb(h, ix, iy)
 
-Backward difference in y at cell (ix,iy).
+    Backward difference in y at cell (ix,iy).
 
-# Arguments
-- h: Input array.
-- ix, iy: Cell indices.
+    # Arguments
+    - h: Input array.
+    - ix, iy: Cell indices.
 
-# Returns
-- h[ix,iy] - h[ix,iy-1].
+    # Returns
+    - h[ix,iy] - h[ix,iy-1].
 """
 @inline dyb(h, ix, iy) = h[ix, iy] - h[ix, iy-1]
 
 """
     eta(h, z, ix, iy)
 
-Compute the free-surface elevation eta = h + z at (ix,iy).
+    Compute the free-surface elevation eta = h + z at (ix,iy).
 
-# Arguments
-- h: Water-depth array.
-- z: Bathymetry array.
-- ix, iy: Cell indices.
+    # Arguments
+    - h: Water-depth array.
+    - z: Bathymetry array.
+    - ix, iy: Cell indices.
 
-# Returns
-- Scalar free-surface elevation.
+    # Returns
+    - Scalar free-surface elevation.
 """
 @inline eta(h, z, ix, iy) = h[ix, iy] + z[ix, iy]
 
 """
     zx_face(z, ix, iy)
 
-Compute the x-face average of bathymetry between (ix,iy) and (ix+1,iy).
+    Compute the x-face average of bathymetry between (ix,iy) and (ix+1,iy).
 
-# Arguments
-- z: Bathymetry array.
-- ix, iy: Cell indices.
+    # Arguments
+    - z: Bathymetry array.
+    - ix, iy: Cell indices.
 
-# Returns
-- Scalar face-averaged bathymetry in x.
+    # Returns
+    - Scalar face-averaged bathymetry in x.
 """
 @inline zx_face(z, ix, iy) = 0.5 * (z[ix, iy] + z[ix+1, iy])
 
 """
     zy_face(z, ix, iy)
 
-Compute the y-face average of bathymetry between (ix,iy) and (ix,iy+1).
+    Compute the y-face average of bathymetry between (ix,iy) and (ix,iy+1).
 
-# Arguments
-- z: Bathymetry array.
-- ix, iy: Cell indices.
+    # Arguments
+    - z: Bathymetry array.
+    - ix, iy: Cell indices.
 
-# Returns
-- Scalar face-averaged bathymetry in y.
+    # Returns
+    - Scalar face-averaged bathymetry in y.
 """
 @inline zy_face(z, ix, iy) = 0.5 * (z[ix, iy] + z[ix, iy+1])
 
 """
     hx_L(h, z, ix, iy)
 
-Reconstructed left depth at the x-face between (ix,iy) and (ix+1,iy).
+    Reconstructed left depth at the x-face between (ix,iy) and (ix+1,iy).
 
-# Arguments
-- h: Water-depth array.
-- z: Bathymetry array.
-- ix, iy: Cell indices.
+    # Arguments
+    - h: Water-depth array.
+    - z: Bathymetry array.
+    - ix, iy: Cell indices.
 
-# Returns
-- Non-negative reconstructed depth on the left side.
+    # Returns
+    - Non-negative reconstructed depth on the left side.
 """
 @inline hx_L(h, z, ix, iy) =
     max(0.0, eta(h, z, ix, iy) - zx_face(z, ix, iy))
@@ -199,15 +198,15 @@ Reconstructed left depth at the x-face between (ix,iy) and (ix+1,iy).
 """
     hx_R(h, z, ix, iy)
 
-Reconstructed right depth at the x-face between (ix,iy) and (ix+1,iy).
+    Reconstructed right depth at the x-face between (ix,iy) and (ix+1,iy).
 
-# Arguments
-- h: Water-depth array.
-- z: Bathymetry array.
-- ix, iy: Cell indices.
+    # Arguments
+    - h: Water-depth array.
+    - z: Bathymetry array.
+    - ix, iy: Cell indices.
 
-# Returns
-- Non-negative reconstructed depth on the right side.
+    # Returns
+    - Non-negative reconstructed depth on the right side.
 """
 @inline hx_R(h, z, ix, iy) =
     max(0.0, eta(h, z, ix+1, iy) - zx_face(z, ix, iy))
@@ -215,15 +214,15 @@ Reconstructed right depth at the x-face between (ix,iy) and (ix+1,iy).
 """
     hy_L(h, z, ix, iy)
 
-Reconstructed left depth at the y-face between (ix,iy) and (ix,iy+1).
+    Reconstructed left depth at the y-face between (ix,iy) and (ix,iy+1).
 
-# Arguments
-- h: Water-depth array.
-- z: Bathymetry array.
-- ix, iy: Cell indices.
+    # Arguments
+    - h: Water-depth array.
+    - z: Bathymetry array.
+    - ix, iy: Cell indices.
 
-# Returns
-- Non-negative reconstructed depth on the left side.
+    # Returns
+    - Non-negative reconstructed depth on the left side.
 """
 @inline hy_L(h, z, ix, iy) =
     max(0.0, eta(h, z, ix, iy) - zy_face(z, ix, iy))
@@ -231,15 +230,15 @@ Reconstructed left depth at the y-face between (ix,iy) and (ix,iy+1).
 """
     hy_R(h, z, ix, iy)
 
-Reconstructed right depth at the y-face between (ix,iy) and (ix,iy+1).
+    Reconstructed right depth at the y-face between (ix,iy) and (ix,iy+1).
 
-# Arguments
-- h: Water-depth array.
-- z: Bathymetry array.
-- ix, iy: Cell indices.
+    # Arguments
+    - h: Water-depth array.
+    - z: Bathymetry array.
+    - ix, iy: Cell indices.
 
-# Returns
-- Non-negative reconstructed depth on the right side.
+    # Returns
+    - Non-negative reconstructed depth on the right side.
 """
 @inline hy_R(h, z, ix, iy) =
     max(0.0, eta(h, z, ix, iy+1) - zy_face(z, ix, iy))
@@ -247,15 +246,15 @@ Reconstructed right depth at the y-face between (ix,iy) and (ix,iy+1).
 """
     desing_velocity(hval, qval, vel_eps)
 
-Compute a depth-limited velocity from depth and momentum.
+    Compute a depth-limited velocity from depth and momentum.
 
-# Arguments
-- hval: Local depth value.
-- qval: Local momentum value.
-- vel_eps: Regularization parameter to avoid division by zero.
+    # Arguments
+    - hval: Local depth value.
+    - qval: Local momentum value.
+    - vel_eps: Regularization parameter to avoid division by zero.
 
-# Returns
-- Scalar velocity, zero in dry cells.
+    # Returns
+    - Scalar velocity, zero in dry cells.
 """
 @inline function desing_velocity(hval, qval, vel_eps)
     if hval <= 0.0
@@ -269,16 +268,16 @@ end
 """
     vel_u(h, hu, ix, iy, vel_eps)
 
-Compute the x-velocity from depth and x-momentum at (ix,iy).
+    Compute the x-velocity from depth and x-momentum at (ix,iy).
 
-# Arguments
-- h: Water-depth array.
-- hu: x-momentum array.
-- ix, iy: Cell indices.
-- vel_eps: Regularization parameter.
+    # Arguments
+    - h: Water-depth array.
+    - hu: x-momentum array.
+    - ix, iy: Cell indices.
+    - vel_eps: Regularization parameter.
 
-# Returns
-- Scalar x-velocity.
+    # Returns
+    - Scalar x-velocity.
 """
 @inline vel_u(h, hu, ix, iy, vel_eps) =
     desing_velocity(h[ix, iy], hu[ix, iy], vel_eps)
@@ -286,16 +285,16 @@ Compute the x-velocity from depth and x-momentum at (ix,iy).
 """
     vel_v(h, hv, ix, iy, vel_eps)
 
-Compute the y-velocity from depth and y-momentum at (ix,iy).
+    Compute the y-velocity from depth and y-momentum at (ix,iy).
 
-# Arguments
-- h: Water-depth array.
-- hv: y-momentum array.
-- ix, iy: Cell indices.
-- vel_eps: Regularization parameter.
+    # Arguments
+    - h: Water-depth array.
+    - hv: y-momentum array.
+    - ix, iy: Cell indices.
+    - vel_eps: Regularization parameter.
 
-# Returns
-- Scalar y-velocity.
+    # Returns
+    - Scalar y-velocity.
 """
 @inline vel_v(h, hv, ix, iy, vel_eps) =
     desing_velocity(h[ix, iy], hv[ix, iy], vel_eps)
@@ -303,16 +302,16 @@ Compute the y-velocity from depth and y-momentum at (ix,iy).
 """
     bc_speed_x(h, hu, ix, iy, g)
 
-Compute characteristic boundary speed in x for the radiative BCs.
+    Compute characteristic boundary speed in x for the radiative BCs.
 
-# Arguments
-- h: Water-depth array.
-- hu: x-momentum array.
-- ix, iy: Cell indices.
-- g: Gravity constant.
+    # Arguments
+    - h: Water-depth array.
+    - hu: x-momentum array.
+    - ix, iy: Cell indices.
+    - g: Gravity constant.
 
-# Returns
-- Scalar wave speed estimate in x.
+    # Returns
+    - Scalar wave speed estimate in x.
 """
 @inline bc_speed_x(h, hu, ix, iy, g) =
     h[ix, iy] > h_eps ?
@@ -322,16 +321,16 @@ Compute characteristic boundary speed in x for the radiative BCs.
 """
     bc_speed_y(h, hv, ix, iy, g)
 
-Compute characteristic boundary speed in y for the radiative BCs.
+    Compute characteristic boundary speed in y for the radiative BCs.
 
-# Arguments
-- h: Water-depth array.
-- hv: y-momentum array.
-- ix, iy: Cell indices.
-- g: Gravity constant.
+    # Arguments
+    - h: Water-depth array.
+    - hv: y-momentum array.
+    - ix, iy: Cell indices.
+    - g: Gravity constant.
 
-# Returns
-- Scalar wave speed estimate in y.
+    # Returns
+    - Scalar wave speed estimate in y.
 """
 @inline bc_speed_y(h, hv, ix, iy, g) =
     h[ix, iy] > h_eps ?
@@ -343,28 +342,83 @@ const g = 1.0
 """
     min_g(A)
 
-Compute the global minimum of array A across all MPI ranks.
+    Compute the global minimum of array A across all MPI ranks.
 
-# Arguments
-- A: Local array on the current rank.
+    # Arguments
+    - A: Local array on the current rank.
 
-# Returns
-- Scalar minimum value over the global domain.
+    # Returns
+    - Scalar minimum value over the global domain.
 """
 min_g(A) = (min_l = minimum(A); MPI.Allreduce(min_l, MPI.MIN, MPI.COMM_WORLD))
 
 """
     max_g(A)
 
-Compute the global maximum of array A across all MPI ranks.
+    Compute the global maximum of array A across all MPI ranks.
 
-# Arguments
-- A: Local array on the current rank.
+    # Arguments
+    - A: Local array on the current rank.
 
-# Returns
-- Scalar maximum value over the global domain.
+    # Returns
+    - Scalar maximum value over the global domain.
 """
 max_g(A) = (max_l = maximum(A); MPI.Allreduce(max_l, MPI.MAX, MPI.COMM_WORLD))
+
+"""
+    save_domain_decomposition!(outdir; ...)
+
+    Gather and serialize the MPI domain ownership map without using any plotting
+    libraries. The output is meant to be consumed by scripts that visualize or
+    inspect the decomposition after the simulation has run.
+"""
+function save_domain_decomposition!(outdir;
+        me,
+        dims,
+        nprocs,
+        nx,
+        ny,
+        nx_global,
+        ny_global,
+        nx_field,
+        ny_field,
+        lx,
+        ly,
+        dx,
+        dy,
+        ix_roi,
+        iy_roi,
+        filename="domain_decomposition.jls")
+
+    rank_local = fill(Float32(me), nx - 2, ny - 2)
+    rank_global = zeros(Float32, (nx - 2) * dims[1], (ny - 2) * dims[2])
+    # DIFF baseline/manual: baseline uses IGG's gather!, manual.jl implements
+    # the same rank-0 assembly explicitly with MPI.Gatherv!.
+    gather!(rank_local, rank_global)
+
+    mkpath(outdir)
+
+    if me == 0
+        payload = (
+            format = "hpc4wc_domain_decomposition_v1",
+            rank = rank_global,
+            dims = Tuple(dims[1:2]),
+            nprocs = nprocs,
+            local_size_with_halo = (nx, ny),
+            global_size_with_halo = (nx_global, ny_global),
+            interior_size_global = size(rank_global),
+            field_size = (nx_field, ny_field),
+            roi_indices = (collect(ix_roi), collect(iy_roi)),
+            domain = (lx = lx, ly = ly),
+            spacing = (dx = dx, dy = dy),
+        )
+        fname = joinpath(outdir, filename)
+        serialize(fname, payload)
+        @info "Saved domain decomposition to $fname"
+    end
+
+    return nothing
+end
 
 # -----------------------------------------------------------------------------
 # Kernels
@@ -373,17 +427,17 @@ max_g(A) = (max_l = maximum(A); MPI.Allreduce(max_l, MPI.MAX, MPI.COMM_WORLD))
 """
     compute_maxspeed!(max_speed_x, max_speed_y, h, hu, hv, z, g, vel_eps)
 
-Compute local maximum wave speeds on all x- and y-faces.
+    Compute local maximum wave speeds on all x- and y-faces.
 
-# Arguments
-- max_speed_x, max_speed_y: Output arrays for x- and y-face speeds.
-- h, hu, hv: Water depth and momentum fields.
-- z: Bathymetry field.
-- g: Gravity constant.
-- vel_eps: Velocity regularization parameter.
+    # Arguments
+    - max_speed_x, max_speed_y: Output arrays for x- and y-face speeds.
+    - h, hu, hv: Water depth and momentum fields.
+    - z: Bathymetry field.
+    - g: Gravity constant.
+    - vel_eps: Velocity regularization parameter.
 
-# Returns
-- Nothing. Writes to max_speed_x and max_speed_y.
+    # Returns
+    - Nothing. Writes to max_speed_x and max_speed_y.
 """
 @parallel_indices (ix, iy) function compute_maxspeed!(
     max_speed_x, max_speed_y,
@@ -423,17 +477,17 @@ end
 """
     compute_draining_timestep!(dt_drain, F₁, G₁, h, dt, _dx, _dy)
 
-Compute the draining timestep constraint per cell based on outgoing fluxes.
+    Compute the draining timestep constraint per cell based on outgoing fluxes.
 
-# Arguments
-- dt_drain: Output array of local drain timesteps.
-- F₁, G₁: Mass fluxes in x and y.
-- h: Water-depth array.
-- dt: Current global timestep.
-- _dx, _dy: Inverse grid spacing.
+    # Arguments
+    - dt_drain: Output array of local drain timesteps.
+    - F₁, G₁: Mass fluxes in x and y.
+    - h: Water-depth array.
+    - dt: Current global timestep.
+    - _dx, _dy: Inverse grid spacing.
 
-# Returns
-- Nothing. Writes to dt_drain.
+    # Returns
+    - Nothing. Writes to dt_drain.
 """
 @parallel_indices (ix, iy) function compute_draining_timestep!(
     dt_drain,
@@ -468,16 +522,16 @@ end
 """
     compute_effective_flux_timesteps!(dtFx, dtGy, dt_drain, F₁, G₁, dt)
 
-Compute face-wise effective timesteps using upwinded draining limits.
+    Compute face-wise effective timesteps using upwinded draining limits.
 
-# Arguments
-- dtFx, dtGy: Output arrays for x- and y-face timesteps.
-- dt_drain: Cell-centered draining timesteps.
-- F₁, G₁: Mass fluxes in x and y.
-- dt: Global timestep.
+    # Arguments
+    - dtFx, dtGy: Output arrays for x- and y-face timesteps.
+    - dt_drain: Cell-centered draining timesteps.
+    - F₁, G₁: Mass fluxes in x and y.
+    - dt: Global timestep.
 
-# Returns
-- Nothing. Writes to dtFx and dtGy.
+    # Returns
+    - Nothing. Writes to dtFx and dtGy.
 """
 @parallel_indices (ix, iy) function compute_effective_flux_timesteps!(
     dtFx, dtGy,
@@ -517,19 +571,19 @@ end
     compute_1st_2nd_and_3th_flux!(F₁, F₂, F₃, G₁, G₂, G₃, hu, hv, h, z, g,
                                  max_speed_x, max_speed_y, vel_eps)
 
-Compute Rusanov fluxes for mass and momentum in both x and y directions.
+    Compute Rusanov fluxes for mass and momentum in both x and y directions.
 
-# Arguments
-- F₁, F₂, F₃: Fluxes on x-faces (mass, x-momentum, y-momentum).
-- G₁, G₂, G₃: Fluxes on y-faces (mass, x-momentum, y-momentum).
-- hu, hv, h: Momentum and depth fields.
-- z: Bathymetry field.
-- g: Gravity constant.
-- max_speed_x, max_speed_y: Precomputed max wave speeds.
-- vel_eps: Velocity regularization parameter.
+    # Arguments
+    - F₁, F₂, F₃: Fluxes on x-faces (mass, x-momentum, y-momentum).
+    - G₁, G₂, G₃: Fluxes on y-faces (mass, x-momentum, y-momentum).
+    - hu, hv, h: Momentum and depth fields.
+    - z: Bathymetry field.
+    - g: Gravity constant.
+    - max_speed_x, max_speed_y: Precomputed max wave speeds.
+    - vel_eps: Velocity regularization parameter.
 
-# Returns
-- Nothing. Writes to F* and G* arrays.
+    # Returns
+    - Nothing. Writes to F* and G* arrays.
 """
 @parallel_indices (ix, iy) function compute_1st_2nd_and_3th_flux!(
     F₁, F₂, F₃,
@@ -641,19 +695,19 @@ end
     update_height_momentum!(h, hu, hv, F₁, G₁, F₂, F₃, G₂, G₃, dtFx, dtGy,
                             z, g, dt, _dx, _dy)
 
-Update water depth and momentum using flux divergence and source terms.
+    Update water depth and momentum using flux divergence and source terms.
 
-# Arguments
-- h, hu, hv: State arrays updated in place.
-- F₁, G₁, F₂, F₃, G₂, G₃: Flux arrays.
-- dtFx, dtGy: Face-wise timesteps for mass fluxes.
-- z: Bathymetry field.
-- g: Gravity constant.
-- dt: Global timestep.
-- _dx, _dy: Inverse grid spacing.
+    # Arguments
+    - h, hu, hv: State arrays updated in place.
+    - F₁, G₁, F₂, F₃, G₂, G₃: Flux arrays.
+    - dtFx, dtGy: Face-wise timesteps for mass fluxes.
+    - z: Bathymetry field.
+    - g: Gravity constant.
+    - dt: Global timestep.
+    - _dx, _dy: Inverse grid spacing.
 
-# Returns
-- Nothing. Updates h, hu, hv in place.
+    # Returns
+    - Nothing. Updates h, hu, hv in place.
 """
 @parallel_indices (ix, iy) function update_height_momentum!(
     h, hu, hv,
@@ -724,16 +778,16 @@ end
 """
     left_bc!(h, hu, hv, g, dt, _dx)
 
-Apply the left-side radiative boundary condition.
+    Apply the left-side radiative boundary condition.
 
-# Arguments
-- h, hu, hv: State arrays updated in place.
-- g: Gravity constant.
-- dt: Timestep.
-- _dx: Inverse grid spacing in x.
+    # Arguments
+    - h, hu, hv: State arrays updated in place.
+    - g: Gravity constant.
+    - dt: Timestep.
+    - _dx: Inverse grid spacing in x.
 
-# Returns
-- Nothing. Updates the left boundary column.
+    # Returns
+    - Nothing. Updates the left boundary column.
 """
 @parallel_indices (iy) function left_bc!(h, hu, hv, g, dt, _dx)
     # Left boundary (ix=1)
@@ -759,16 +813,16 @@ end
 """
     right_bc!(h, hu, hv, g, dt, _dx)
 
-Apply the right-side radiative boundary condition.
+    Apply the right-side radiative boundary condition.
 
-# Arguments
-- h, hu, hv: State arrays updated in place.
-- g: Gravity constant.
-- dt: Timestep.
-- _dx: Inverse grid spacing in x.
+    # Arguments
+    - h, hu, hv: State arrays updated in place.
+    - g: Gravity constant.
+    - dt: Timestep.
+    - _dx: Inverse grid spacing in x.
 
-# Returns
-- Nothing. Updates the right boundary column.
+    # Returns
+    - Nothing. Updates the right boundary column.
 """
 @parallel_indices (iy) function right_bc!(h, hu, hv, g, dt, _dx)
     nx, ny = size(h)
@@ -795,16 +849,16 @@ end
 """
     bottom_bc!(h, hu, hv, g, dt, _dy)
 
-Apply the bottom-side radiative boundary condition.
+    Apply the bottom-side radiative boundary condition.
 
-# Arguments
-- h, hu, hv: State arrays updated in place.
-- g: Gravity constant.
-- dt: Timestep.
-- _dy: Inverse grid spacing in y.
+    # Arguments
+    - h, hu, hv: State arrays updated in place.
+    - g: Gravity constant.
+    - dt: Timestep.
+    - _dy: Inverse grid spacing in y.
 
-# Returns
-- Nothing. Updates the bottom boundary row.
+    # Returns
+    - Nothing. Updates the bottom boundary row.
 """
 @parallel_indices (ix) function bottom_bc!(h, hu, hv, g, dt, _dy)
     # Bottom boundary (iy=1)
@@ -829,16 +883,16 @@ end
 """
     top_bc!(h, hu, hv, g, dt, _dy)
 
-Apply the top-side radiative boundary condition.
+    Apply the top-side radiative boundary condition.
 
-# Arguments
-- h, hu, hv: State arrays updated in place.
-- g: Gravity constant.
-- dt: Timestep.
-- _dy: Inverse grid spacing in y.
+    # Arguments
+    - h, hu, hv: State arrays updated in place.
+    - g: Gravity constant.
+    - dt: Timestep.
+    - _dy: Inverse grid spacing in y.
 
-# Returns
-- Nothing. Updates the top boundary row.
+    # Returns
+    - Nothing. Updates the top boundary row.
 """
 @parallel_indices (ix) function top_bc!(h, hu, hv, g, dt, _dy)
     nx, ny = size(h)
@@ -863,35 +917,16 @@ Apply the top-side radiative boundary condition.
 end
 
 """
-    sponge_layer!(hu, hv, σ)
-
-Apply a multiplicative damping layer to momentum fields. 
-Can be removed for when the domain expansion factor is set large enough.
-
-# Arguments
-- hu, hv: Momentum arrays updated in place.
-- σ: Damping coefficient field in [0,1].
-
-# Returns
-- Nothing. Updates hu and hv in place.
-"""
-@parallel function sponge_layer!(hu, hv, σ)
-    @all(hu) = @all(hu) * (1 - @all(σ))
-    @all(hv) = @all(hv) * (1 - @all(σ))
-    return nothing
-end
-
-"""
     dry_cell_fix!(h, hu, hv, h_eps)
 
-Clamp dry or invalid cells to zero depth and momentum.
+    Clamp dry or invalid cells to zero depth and momentum.
 
-# Arguments
-- h, hu, hv: State arrays updated in place.
-- h_eps: Dry-cell threshold.
+    # Arguments
+    - h, hu, hv: State arrays updated in place.
+    - h_eps: Dry-cell threshold.
 
-# Returns
-- Nothing. Updates h, hu, hv in place.
+    # Returns
+    - Nothing. Updates h, hu, hv in place.
 """
 @parallel_indices (ix, iy) function dry_cell_fix!(h, hu, hv, h_eps)
     nx, ny = size(h)
@@ -910,352 +945,55 @@ Clamp dry or invalid cells to zero depth and momentum.
     return nothing
 end
 
-"""
-    check_bc_preserves_eta(h, z, η0, ix_roi, iy_roi; tol=1e-8)
-
-Check whether boundary conditions preserve a target free-surface level.
-
-# Arguments
-- h: Water-depth array.
-- z: Bathymetry array.
-- η0: Reference free-surface array.
-- ix_roi, iy_roi: Indices defining the region of interest.
-- tol: Tolerance for max deviation.
-
-# Returns
-- Boolean indicating if the max deviation is within tol.
-"""
-function check_bc_preserves_eta(h, z, η0, ix_roi, iy_roi; tol=1e-8)
-    eta_roi = h[ix_roi, iy_roi] .+ z[ix_roi, iy_roi]
-
-    top = eta_roi[:, end]
-    bottom = eta_roi[:, 1]
-    left = eta_roi[1, :]
-    right = eta_roi[end, :]
-
-    bvals = vcat(vec(top), vec(bottom), vec(left), vec(right))
-    maxdev = maximum(abs.(bvals .- η0))
-    @info "BC eta_roi max deviation" maxdev
-    return maxdev <= tol
-end
-
-
-"""
-    Island
-
-Container for a cosine-ramp island specification.
-
-# Fields
-- x0, y0: Island center coordinates.
-- zmax: Maximum elevation at the flat top.
-- rflat: Radius of the flat top.
-- redge: Radius where the island tapers to zero.
-"""
-struct Island
-    x0::Float64
-    y0::Float64
-    zmax::Float64
-    rflat::Float64
-    redge::Float64
-end
-
-"""
-    background_bumps(xs, ys; nhills=40, amp_range=(0.01, 0.03),
-                     sigma_range=(1.5, 4.0), seed=nothing)
-
-Generate a random Gaussian hill field over the domain grid.
-
-# Arguments
-- xs, ys: Coordinate vectors.
-- nhills: Number of Gaussian hills.
-- amp_range: Min/max hill amplitudes.
-- sigma_range: Min/max hill widths.
-- seed: Optional random seed.
-
-# Returns
-- 2D array of background bathymetry bumps.
-"""
-function background_bumps(xs, ys; nhills=40, amp_range=(0.01, 0.03),
-                          sigma_range=(1.5, 4.0), seed=nothing)
-
-    if seed !== nothing
-        Random.seed!(seed)
-    end
-
-    X = [x for x in xs, y in ys]
-    Y = [y for x in xs, y in ys]
-
-    X = Data.Array(X_cpu)
-    Y = Data.Array(Y_cpu)
-
-    Z = @zeros(length(xs), length(ys))
-
-    # Domain limits
-    xmin, xmax = min_g(xs), max_g(xs)
-    ymin, ymax = min_g(ys), max_g(ys)
-
-    for _ in 1:nhills
-        # Random hill center
-        x0 = rand() * (xmax - xmin) + xmin
-        y0 = rand() * (ymax - ymin) + ymin
-
-        # Random shallow amplitude
-        A = rand() * (amp_range[2] - amp_range[1]) + amp_range[1]
-
-        # Random width
-        σ = rand() * (sigma_range[2] - sigma_range[1]) + sigma_range[1]
-
-        Z .+= A .* exp.(-((X .- x0).^2 .+ (Y .- y0).^2) ./ (2σ^2))
-    end
-
-    return Z
-end
-
-"""
-    add_island!(z, xs, ys, isl)
-
-Add an island profile to bathymetry array z in place.
-
-# Arguments
-- z: Bathymetry array updated in place.
-- xs, ys: Coordinate vectors.
-- isl: Island specification.
-
-# Returns
-- z with the island elevation added.
-"""
-function add_island!(z, xs, ys, isl::Island)
-    for i in eachindex(xs), j in eachindex(ys)
-        x = xs[i]
-        y = ys[j]
-        r = sqrt((x - isl.x0)^2 + (y - isl.y0)^2)
-
-        if r <= isl.rflat
-            z[i, j] += isl.zmax
-        elseif r <= isl.redge
-            s = (r - isl.rflat) / (isl.redge - isl.rflat)
-            z[i, j] += isl.zmax * 0.5 * (1 + cos(pi * s))
-        end
-    end
-    return z
-end
-
-"""
-    build_topography(xs, ys; islands=Island[], background=nothing)
-
-Construct bathymetry from optional islands and background function.
-
-# Arguments
-- xs, ys: Coordinate vectors.
-- islands: Array of Island specs.
-- background: Optional function (xs, ys) -> array.
-
-# Returns
-- Bathymetry array z.
-"""
-function build_topography(xs, ys; islands=Island[], background=nothing)
-    z = @zeros(length(xs), length(ys))
-
-    for isl in islands
-        add_island!(z, xs, ys, isl)
-    end
-
-    if background !== nothing
-        z .+= background(xs, ys)
-    end
-
-    return z
-end
-
-"""
-    load_topography_data(nx_aoi_ext, ny_aoi_ext, nx_local, ny_local, me, coords, comm_cart)
-
-Load bathymetry and initial free surface, then distribute local slices.
-
-# Arguments
-- nx_aoi_ext, ny_aoi_ext: AOI resolution used for interpolation.
-- nx_local, ny_local: Local grid dimensions including halos.
-- me: MPI rank id.
-- coords: MPI Cartesian coordinates of the rank.
-- comm_cart: MPI Cartesian communicator.
-
-# Returns
-- z: Local bathymetry array (ParallelStencil backend).
-- η0: Local initial free-surface array (ParallelStencil backend).
-"""
-function load_topography_data(nx_aoi_ext, ny_aoi_ext, nx_local, ny_local, me, coords, comm_cart)
-    # Use the true global dimensions dictated by ImplicitGlobalGrid
-    NX = nx_g()
-    NY = ny_g()
-
-    # Allocate full global arrays on ALL ranks (Required for MPI.Bcast!)
-    z_global  = zeros(NX, NY)
-    η0_global = zeros(NX, NY)
-
-    # Only Rank 0 builds the full global data
-    if me == 0
-        base_file = "data/tsunamiOku/D112-94-50m.txt"
-        wave_file = "data/tsunamiOku/I112-94-50m-17a.txt"
-
-        nx_aoi, ny_aoi = 112, 94 # ENSURE THIS MATCHES THE DATA FILES
-
-        # Read as string, split by whitespace, and parse to Float64
-        read_values(filename) = parse.(Float64, split(read(filename, String)))
-
-        z_vec = read_values(base_file)
-        η0_vec = read_values(wave_file)
-
-        if length(z_vec) != nx_aoi * ny_aoi || length(η0_vec) != nx_aoi * ny_aoi
-            error("Data files do not match expected dimensions.")
-        end
-
-        # Reshape to 2D arrays
-        z_inner_orig = reshape(z_vec, nx_aoi, ny_aoi)
-        η0_inner_orig = reshape(η0_vec, nx_aoi, ny_aoi)
-
-        z_inner = zeros(nx_aoi_ext, ny_aoi_ext)
-        η0_inner = zeros(nx_aoi_ext, ny_aoi_ext)
-        
-        # Bilinear interpolation to expand the inner grid to the extended grid
-        for i in 1:nx_aoi_ext
-            for j in 1:ny_aoi_ext
-                # Map the new output index continuously to the original input grid
-                x = 1 + (i - 1) * (nx_aoi - 1) / (nx_aoi_ext - 1)
-                y = 1 + (j - 1) * (ny_aoi - 1) / (ny_aoi_ext - 1)
-                
-                # Get integer bounds for interpolation
-                x1, y1 = floor(Int, x), floor(Int, y)
-                x2, y2 = min(x1 + 1, nx_aoi), min(y1 + 1, ny_aoi)
-                
-                # Calculate weights
-                wx = x - x1
-                wy = y - y1
-                
-                # Interpolate z
-                z_inner[i, j] = (1 - wx) * (1 - wy) * z_inner_orig[x1, y1] + 
-                                     wx  * (1 - wy) * z_inner_orig[x2, y1] + 
-                                (1 - wx) * wy  * z_inner_orig[x1, y2] + 
-                                     wx  * wy  * z_inner_orig[x2, y2]
-                                
-                # Interpolate η0
-                η0_inner[i, j] = (1 - wx) * (1 - wy) * η0_inner_orig[x1, y1] + 
-                                      wx  * (1 - wy) * η0_inner_orig[x2, y1] + 
-                                 (1 - wx) * wy  * η0_inner_orig[x1, y2] + 
-                                      wx  * wy  * η0_inner_orig[x2, y2]
-            end
-        end
-
-        # Center the interpolated AOI inside the True Global Domain
-        pad_x = round(Int, (NX - nx_aoi_ext) / 2)
-        pad_y = round(Int, (NY - ny_aoi_ext) / 2)
-
-        # Pad the arrays
-        for i in 1:NX
-            for j in 1:NY
-                # Clamp to the closest valid index of the inner grid
-                orig_i = clamp(i - pad_x, 1, nx_aoi_ext)
-                orig_j = clamp(j - pad_y, 1, ny_aoi_ext)
-                
-                # Stretch the edge bathymetry outwards
-                z_global[i, j] = z_inner[orig_i, orig_j]
-                
-                # Stretch the wave data outwards 
-                η0_global[i, j] = η0_inner[orig_i, orig_j]
-            end
-        end
-    end
-
-    # Broadcast the completed global arrays from Rank 0 to all other ranks
-    MPI.Bcast!(z_global, 0, comm_cart)
-    MPI.Bcast!(η0_global, 0, comm_cart)
-
-    # Each rank mathematically extracts its local slice (including halos!)
-    z_local = zeros(nx_local, ny_local)
-    η0_local = zeros(nx_local, ny_local)
-
-    for ix in 1:nx_local
-        for iy in 1:ny_local
-            # Map local index to global index based on MPI Cartesian coordinates
-            IX = coords[1] * (nx_local - 2) + ix
-            IY = coords[2] * (ny_local - 2) + iy
-            
-            z_local[ix, iy] = z_global[IX, IY]
-            η0_local[ix, iy] = η0_global[IX, IY]
-        end
-    end
-
-    # Cast to ParallelStencil arrays
-    return Data.Array(z_local), Data.Array(η0_local)
-end
-
 # -----------------------------------------------------------------------------
 # Main
 # -----------------------------------------------------------------------------
 
 """
-    swe2d_topography_frames(nx_aoi, ny_aoi; nt=0, outdir="frames",
-                            do_viz=true,
-                            debug_roi=false, print_error_metrics=true,
-                            gpu_test_memory_restriction_workound=false,
-                            domain_expansion_factor=3.0)
+    run_baseline(nx_global, ny_global; nt=20, outdir="frames",
+                 do_viz=false, benchmark=false)
 
-Run the 2D well-balanced SWE solver with MPI domain decomposition.
-
-# Arguments
-- nx_aoi, ny_aoi: Resolution of the area of interest.
-- nt: Number of timesteps (0 uses an nx-based default).
-- outdir: Output directory for frames or arrays.
-- do_viz: Enable serialized array output.
-- debug_roi: Visualize the full domain instead of the ROI.
-- print_error_metrics: Print steady-state error metrics on rank 0.
-- gpu_test_memory_restriction_workound: Use smaller domain for GPU tests.
-- domain_expansion_factor: Domain multiplier for sponge/BC padding.
-
-# Returns
-- Nothing. Runs the simulation and writes outputs.
+Run the simple 2D SWE baseline with IGG domain decomposition.
 """
-@views function swe2d_topography_frames(nx_aoi, ny_aoi;
-            nt=0,
-            outdir = "frames", 
-            do_viz = true, 
-            debug_roi=false,
-            print_error_metrics=true,
-            gpu_test_memory_restriction_workound=false,
-            domain_expansion_factor=3.0)
-    # physics and numerics
-    lx_aoi = 50.0 # aoi = area of interest
-    ly_aoi = 50.0
+@views function run_baseline(nx_global, ny_global;
+            nt=20,
+            outdir="frames",
+            do_viz=false,
+            benchmark=false)
+    lx = 50.0
+    ly = 50.0
 
-    # Multiply domain size to allow for sponge layer and BCs
-    if gpu_test_memory_restriction_workound
-        domain_expansion_factor = 1.0
+    # Let IGG/MPI choose a compact 2D process topology instead of forcing 2x2.
+    # We query the same MPI_Dims_create choice before init_global_grid so the
+    # requested global grid can still be split into uniform local blocks.
+    mpi_was_initialized = MPI.Initialized()
+    if !mpi_was_initialized
+        MPI.Init()
     end
-    lx = domain_expansion_factor * lx_aoi
-    ly = domain_expansion_factor * ly_aoi
-    nx = round(Int, domain_expansion_factor * nx_aoi)
-    ny = round(Int, domain_expansion_factor * ny_aoi)
+    nprocs_world = MPI.Comm_size(MPI.COMM_WORLD)
+    dims_mpi_3d = MPI.Dims_create!(nprocs_world, [0, 0, 1])
+    dims_mpi = dims_mpi_3d[1:2]
 
-    # Define desired global size
-    nx_global = round(Int, domain_expansion_factor * nx_aoi)
-    ny_global = round(Int, domain_expansion_factor * ny_aoi)
+    if (nx_global - 2) % dims_mpi[1] != 0 || (ny_global - 2) % dims_mpi[2] != 0
+        error("Global interior size $(nx_global - 2)x$(ny_global - 2) must be divisible by IGG's chosen MPI topology $(dims_mpi[1])x$(dims_mpi[2]).")
+    end
 
-    # Force a 2D MPI topology.
-    dims_mpi = [2, 2]
+    nx = div(nx_global - 2, dims_mpi[1]) + 2
+    ny = div(ny_global - 2, dims_mpi[2]) + 2
 
-    # Compute local chunk sizes (+2 for halos)
-    nx = round(Int, (nx_global - 2) / dims_mpi[1]) + 2
-    ny = round(Int, (ny_global - 2) / dims_mpi[2]) + 2
-
-    # Init global grid and get local grid info
+    # DIFF baseline/manual: this is the central IGG setup. It creates the
+    # Cartesian communicator, computes rank coordinates, and installs IGG's
+    # global-index/halo-exchange helpers. manual.jl replaces this block with
+    # explicit MPI.Init, MPI.Cart_create, MPI.Cart_get, and MPI.Cart_shift calls.
     me, dims, nprocs, coords, comm_cart = init_global_grid(
         nx, ny, 1;
-        dimx=dims_mpi[1],
-        dimy=dims_mpi[2],
-        dimz=1,
+        init_MPI=false,
+        quiet=benchmark,
         select_device=false
     )
 
-
+    # DIFF baseline/manual: IGG gives coords directly. manual.jl derives the
+    # same boundary flags from MPI.Cart_shift neighbors and MPI.PROC_NULL.
     is_left   = coords[1] == 0
     is_right  = coords[1] == dims[1] - 1
     is_bottom = coords[2] == 0
@@ -1263,44 +1001,53 @@ Run the 2D well-balanced SWE solver with MPI domain decomposition.
     
     b_width     = (8, 8, 0)
 
-    if nt==0
-        nt   = Int(nt_nx_multiplier * nx_aoi)
-    end
-    
-    if me == 0
+    if me == 0 && !benchmark
         println("Global domain size (including halos): ", nx_global, " x ", ny_global)
-        println("MPI topology: ", dims_mpi[1], " x ", dims_mpi[2])
+        println("MPI topology: ", dims[1], " x ", dims[2])
         println("Local domain size (including halos): ", nx, " x ", ny)
         println("Time steps: ", nt)
     end
 
     nvis = 5
-
+    # DIFF baseline/manual: nx_g()/ny_g() and x_g()/y_g() are IGG global-grid
+    # helpers. manual.jl computes these values from nx_global/ny_global and a
+    # local get_global_indices(...) helper.
     dx = lx / (nx_g() - 1)
     dy = ly / (ny_g() - 1)
-
     vel_eps = min(dx, dy)^4
-
     _dx  = 1.0 / dx
     _dy  = 1.0 / dy
 
-    # ROI indices for visualization
-    pad_x = round(Int, (nx_g() - nx_aoi) / 2)
-    pad_y = round(Int, (ny_g() - ny_aoi) / 2)
-
-    if debug_roi
-    ix_roi = 1:nx_g()
-    iy_roi = 1:ny_g()
-    else
-        ix_roi = (pad_x + 1):(pad_x + nx_aoi)
-        iy_roi = (pad_y + 1):(pad_y + ny_aoi)
-    end
-    
-    # state
     h  = @zeros(nx, ny)
     hu = @zeros(nx, ny)
     hv = @zeros(nx, ny)
 
+    ix_roi = 2:(nx_g() - 1)
+    iy_roi = 2:(ny_g() - 1)
+
+    if !benchmark
+        save_domain_decomposition!(outdir;
+            me = me,
+            dims = dims,
+            nprocs = nprocs,
+            nx = nx,
+            ny = ny,
+            nx_global = nx_global,
+            ny_global = ny_global,
+            nx_field = nx_g() - 2,
+            ny_field = ny_g() - 2,
+            lx = lx,
+            ly = ly,
+            dx = dx,
+            dy = dy,
+            ix_roi = ix_roi,
+            iy_roi = iy_roi,
+        )
+    end
+
+    # DIFF baseline/manual: these coordinates include halo cells through IGG's
+    # global x_g/y_g mapping. manual.jl builds equivalent halo-inclusive index
+    # ranges by hand.
     xs = [x_g(ix, dx, h) - lx / 2 for ix in 1:nx]
     ys = [y_g(iy, dy, h) - ly / 2 for iy in 1:ny]
 
@@ -1316,63 +1063,25 @@ Run the 2D well-balanced SWE solver with MPI domain decomposition.
     max_speed_x = @zeros(nx - 1, ny)
     max_speed_y = @zeros(nx, ny - 1)
 
-    # -------------------------------------------------------------------------
-    # topography
-    # -------------------------------------------------------------------------
-    # islands = [
-    # Island(-10.0,  0.0, 0.12, 3.0, 4.5),   # above free surface if η≈0.10 outside
-    # Island(  9.0,  6.0, 0.105,5.0, 6.5),   # submerged bump
-    # Island(  5.0, -8.0, 0.12, 2.5, 4.0),
-    # Island( 15.0, -3.0, 0.11, 2.0, 7.0),
-    # Island(-12.0,  8.0, 0.11, 3.0, 5.0),
-    # Island(-15.0,-13.0, 0.12, 4.5, 6.0)   # clearly emergent   
-    # ]
+    z_local  = zeros(nx, ny)
+    η0_local = zeros(nx, ny)
 
-    ## DEFAULT TOPOGRAPHY: Load from file and interpolate to the grid
-    if !gpu_test_memory_restriction_workound
-        z, η0 = load_topography_data(nx_aoi, ny_aoi, nx, ny, me, coords, comm_cart)
-    else
-        # -------------------------------------------------------------------------
-        # topography (Analytical for Scaling Study)
-        # -------------------------------------------------------------------------
-    
-        z_local  = zeros(nx, ny)
-        η0_local = zeros(nx, ny)
+    h_base = 15.0
+    bump_amplitude = 2.0
+    bump_width = max(lx, ly) / 12
 
-        # Simple analytical baseline: flat bottom and one free-surface bump.
-        h_base  = 15.0
-        A_spike = 2.0
-        σ_spike = max(lx, ly) / 12
+    for i in 1:nx
+        for j in 1:ny
+            x = xs[i]
+            y = ys[j]
 
-        for i in 1:nx
-            for j in 1:ny
-                x = xs[i]
-                y = ys[j]
-
-                z_local[i, j] = 0.0
-                η0_local[i, j] = h_base + A_spike * exp(-(x^2 + y^2) / (2 * σ_spike^2))
-            end
+            z_local[i, j] = 0.0
+            η0_local[i, j] = h_base + bump_amplitude * exp(-(x^2 + y^2) / (2 * bump_width^2))
         end
-
-        # Cast to ParallelStencil arrays (GPU or CPU depending on @init_parallel_stencil)
-        z  = Data.Array(z_local)
-        η0 = Data.Array(η0_local)
-
     end
 
-    # wet/dry sea level steady state
-    # η0 .= 0
-
-    # # add a gaussian bump to the initial condition to generate some wave activity
-    # x_c     = -10.0    # X center of the spike
-    # y_c     = -20.0    # Y center of the spike
-    # σ_spike = 2.5    # Width of the spike (standard deviation)
-    # A_spike = 30.0    # Amplitude of the drop/spike
-    # for i in eachindex(xs), j in eachindex(ys)
-    #     x = xs[i]
-    #     y = ys[j]
-    #     η0[i, j] += A_spike * exp(-((x - x_c)^2 + (y - y_c)^2) / (2 * σ_spike^2))
-    # end
+    z  = Data.Array(z_local)
+    η0 = Data.Array(η0_local)
 
     hmin  = 1e-2
     h .= max.(0.0, η0 .- z)
@@ -1381,97 +1090,40 @@ Run the 2D well-balanced SWE solver with MPI domain decomposition.
 
     dtFx = @zeros(nx - 1, ny)
     dtGy = @zeros(nx, ny - 1)
-   
-    # -------------------------------------------------------------------------
-    # sponge layer
-    # -------------------------------------------------------------------------
-
-    # backend arrays
-    d = @zeros(nx, ny)
-    σ = @zeros(nx, ny)
-
-    layers  = 20
-    _layers = 1.0 / layers
-    σmax    = 0.15
-
-    # 1D index vectors on the backend
-    X = Data.Array(reshape(xs, nx, 1))   # nx × 1
-    Y = Data.Array(reshape(ys, 1, ny))   # 1 × ny
-
-    # distance to global boundary in terms of grid cells
-    dist_x = min.(X .- (-lx/2), (lx/2) .- X) .* _dx
-    dist_y = min.(Y .- (-ly/2), (ly/2) .- Y) .* _dy
-    
-    d .= min.(dist_x, dist_y)
-
-    # damping profile
-    σ .= ifelse.(d .< layers,
-                σmax .* (1 .- d .* _layers),
-                zero(eltype(σ)))
-
-    # # -------------------------------------------------------------------------
-    # # initial condition
-    # # -------------------------------------------------------------------------
     
     time = 0.0
-
-    # h_in  = 0.20
-    # h_out = 0.10
-    # r0    = 2.5
-    # hmin  = 1e-6
-
-    # η0 = [((x^2 + y^2) < r0^2) ? h_in : h_out for x in xs, y in ys]
-    # h .= max.(hmin, η0 .- z)
-
 
     # -------------------------------------------------------------------------
     # visualization
     # -------------------------------------------------------------------------
 
-    if do_viz
+    if do_viz && !benchmark
         if me == 0
             println("Using visualization: Array output")
         end
         mkpath(outdir)
         
         nx_v, ny_v = (nx - 2) * dims[1], (ny - 2) * dims[2]
-        h_v   = zeros(nx_v, ny_v)
-        z_v   = zeros(nx_v, ny_v)
+        h_v = zeros(nx_v, ny_v)
+        z_v = zeros(nx_v, ny_v)
         h_inn = zeros(nx - 2, ny - 2)
         z_inn = zeros(nx - 2, ny - 2)
-        
-        # Compute area of interes size relative to global grid
-        nx_aoi_v = round(Int, nx_v / domain_expansion_factor)
-        ny_aoi_v = round(Int, ny_v / domain_expansion_factor)
-        
-        pad_x_v  = round(Int, (nx_v - nx_aoi_v) / 2)
-        pad_y_v  = round(Int, (ny_v - ny_aoi_v) / 2)
-        ix_roi_v = (pad_x_v + 1):(pad_x_v + nx_aoi_v)
-        iy_roi_v = (pad_y_v + 1):(pad_y_v + ny_aoi_v)
-        
-        xs_v = LinRange(-lx / 2 + dx, lx / 2 - dx, nx_v)
-        ys_v = LinRange(-ly / 2 + dy, ly / 2 - dy, ny_v)
-        xs_roi_v = xs_v[ix_roi_v]
-        ys_roi_v = ys_v[iy_roi_v]
 
         h_inn .= Array(h)[2:end-1, 2:end-1]; gather!(h_inn, h_v)
         z_inn .= Array(z)[2:end-1, 2:end-1]; gather!(z_inn, z_v)
 
         if me == 0
-            h_slice = h_v[ix_roi_v, iy_roi_v]
-            z_slice = z_v[ix_roi_v, iy_roi_v]
-
             frame_id = Ref(0)
             @info "Saving arrays to $outdir"
             function save_array!()
                 frame_id[] += 1
                 fname = joinpath(outdir, @sprintf("array_frame_%06d.jls", frame_id[]))
-                serialize(fname, (h=Array(convert.(Float32, h_slice)),)) 
+                serialize(fname, (h=Array(convert.(Float32, h_v)),))
             end
             function save_array_with_z!()
                 frame_id[] += 1
                 fname = joinpath(outdir, @sprintf("array_frame_%06d.jls", frame_id[]))
-                serialize(fname, (h=Array(convert.(Float32, h_slice)), z=Array(convert.(Float32, z_slice))))
+                serialize(fname, (h=Array(convert.(Float32, h_v)), z=Array(convert.(Float32, z_v))))
             end
             save_array_with_z!()
         end
@@ -1482,11 +1134,16 @@ Run the 2D well-balanced SWE solver with MPI domain decomposition.
     # -------------------------------------------------------------------------
 
     dt = 0.0
+    loop_walltime = 0.0
+
+    @synchronize()
+    MPI.Barrier(comm_cart)
+    loop_t0 = time_ns()
 
     for it in 1:nt
         @parallel compute_maxspeed!(max_speed_x, max_speed_y, h, hu, hv, z, g, vel_eps)
         
-        if 0.99 / (maximum(max_speed_x) * _dx + maximum(max_speed_y) * _dy) < dt 
+        if !benchmark && 0.99 / (maximum(max_speed_x) * _dx + maximum(max_speed_y) * _dy) < dt 
             println("Warning: Local dt = ", 0.99 / (maximum(max_speed_x) * _dx + maximum(max_speed_y) * _dy), " is bigger than the current CLF, at iteration ", it)
         end
 
@@ -1506,16 +1163,19 @@ Run the 2D well-balanced SWE solver with MPI domain decomposition.
             hu, hv, h, z, g,
             max_speed_x, max_speed_y, vel_eps
         )
-        @hide_communication b_width begin
-            @parallel compute_draining_timestep!(
-                dt_drain,
-                F₁, G₁,
-                h,
-                dt,
-                _dx, _dy
-            )
-            update_halo!(dt_drain)
-        end
+
+        @parallel compute_draining_timestep!(
+            dt_drain,
+            F₁, G₁,
+            h,
+            dt,
+            _dx, _dy
+        )
+        # DIFF baseline/manual: IGG provides this halo update. manual.jl calls
+        # update_halo_dt_drain!(..., comm_cart, neighbors_x, neighbors_y), which
+        # is implemented with explicit MPI.Sendrecv!.
+        update_halo!(dt_drain)
+
         
         @parallel compute_effective_flux_timesteps!(
             dtFx, dtGy,
@@ -1524,14 +1184,15 @@ Run the 2D well-balanced SWE solver with MPI domain decomposition.
             dt
         )
         
-        @hide_communication b_width begin
-            @parallel update_height_momentum!(
-                h, hu, hv,
-                F₁, G₁, F₂, F₃, G₂, G₃, dtFx, dtGy,
-                z, g, dt, _dx, _dy
-            )           
-            update_halo!(h, hu, hv)
-        end
+        @parallel update_height_momentum!(
+            h, hu, hv,
+            F₁, G₁, F₂, F₃, G₂, G₃, dtFx, dtGy,
+            z, g, dt, _dx, _dy
+        )           
+        # DIFF baseline/manual: same operation conceptually, but baseline lets
+        # IGG exchange all halos. manual.jl exchanges h/hu/hv with explicit
+        # blocking Sendrecv calls.
+        update_halo!(h, hu, hv)
 
         @parallel dry_cell_fix!(h, hu, hv, hmin)
 
@@ -1552,71 +1213,52 @@ Run the 2D well-balanced SWE solver with MPI domain decomposition.
             @parallel (1:nx) top_bc!(h, hu, hv, g, dt, _dy)
         end
         
-        # Would need to only apply sponge layer on ranks that border the global domain boundaries
-        # As multiGPU runs super fast we can affort to simply make the domain huge 
-        # such that the sponge layer is not required
-        # @parallel sponge_layer!(hu, hv, σ)
-        
         @parallel dry_cell_fix!(h, hu, hv, hmin)
 
-        if do_viz && it % nvis == 0
+        if do_viz && !benchmark && it % nvis == 0
 
+            # DIFF baseline/manual: field output gathering uses IGG gather! here.
+            # manual.jl uses gather_global_array_manual!(...) with MPI.Gatherv!.
             h_inn .= Array(h)[2:end-1, 2:end-1]; gather!(h_inn, h_v)
             z_inn .= Array(z)[2:end-1, 2:end-1]; gather!(z_inn, z_v)
             
             if me == 0
-                h_slice = h_v[ix_roi_v, iy_roi_v]
-                z_slice = z_v[ix_roi_v, iy_roi_v]
                 save_array!()
             end
         end
         
-        if me == 0 && !gpu_test_memory_restriction_workound
+        if me == 0 && !benchmark
             percent = 100 * it / nt
             print("\rProgress: $(round(percent, digits=1)) %")
             flush(stdout)
         end
     end
-    # -------------------------------------------------------------------------
-    # Validation
-    # -------------------------------------------------------------------------
 
+    @synchronize()
+    loop_walltime = MPI.Allreduce((time_ns() - loop_t0) * 1e-9, MPI.MAX, comm_cart)
 
-    η = h .+ z
-
-    # Compare against the initial free surface η0
-    err = abs.(η .- η0)
-
-    # Wet-cell mask:
-    # use cells that were initially wet and are still meaningfully wet
-    wet_mask = (η0 .- z .> h_eps) .& (h .> h_eps)
-
-    local_nwet = sum(wet_mask)
-    nwet = MPI.Allreduce(local_nwet, MPI.SUM, comm_cart)
-    
-    local_err_max = local_nwet > 0 ? maximum(err[wet_mask]) : 0.0
-    local_scale_max = local_nwet > 0 ? maximum(abs.(η0[wet_mask])) : 0.0
-
-    Linf_abs = MPI.Allreduce(local_err_max, MPI.MAX, comm_cart)
-    η0_scale = MPI.Allreduce(local_scale_max, MPI.MAX, comm_cart)
-
-    if me == 0 && print_error_metrics
-        if nwet > 0
-            # A sensible relative L∞ error:
-            # normalize by the largest initial free-surface magnitude on wet cells
-            Linf_rel = η0_scale > 0 ? Linf_abs / η0_scale : Linf_abs
-
-            println("wet cells used: ", nwet)
-            println("steady-state L∞ absolute error on wet cells: ", Linf_abs)
-            println("steady-state L∞ relative error on wet cells: ", Linf_rel)
-        else
-            println("No wet cells found for steady-state error evaluation.")
-            Linf_abs = NaN
-            Linf_rel = NaN
+    if benchmark
+        if me == 0
+            cells_per_step = nx_g() * ny_g()
+            cell_updates_per_second = cells_per_step * nt / loop_walltime
+            println(
+                "BENCHMARK ",
+                "walltime_seconds=", @sprintf("%.9f", loop_walltime), " ",
+                "nt=", nt, " ",
+                "global_size=", nx_g(), "x", ny_g(), " ",
+                "local_size=", nx, "x", ny, " ",
+                "nprocs=", nprocs, " ",
+                "steps_per_second=", @sprintf("%.6f", nt / loop_walltime), " ",
+                "cell_updates_per_second=", @sprintf("%.6e", cell_updates_per_second)
+            )
         end
+        # DIFF baseline/manual: IGG owns grid teardown here. manual.jl finalizes
+        # MPI only if it initialized MPI itself.
+        finalize_global_grid(finalize_MPI=!mpi_was_initialized)
+        return loop_walltime
     end
+
     if me == 0
-        # print time
         println("\nSimulation completed.")
         println("Total simulation time: $(round(time, digits=2)) seconds")
 
@@ -1625,16 +1267,19 @@ Run the 2D well-balanced SWE solver with MPI domain decomposition.
         end
     end
 
-    finalize_global_grid()
-    return nothing
+    # DIFF baseline/manual: IGG owns grid teardown here. manual.jl finalizes MPI
+    # only if it initialized MPI itself.
+    finalize_global_grid(finalize_MPI=!mpi_was_initialized)
+    return loop_walltime
 
 end
 
-input_nx = 500
-input_ny = 500
-input_nt = 2000
-input_outdir = "docs/frames/frames_topography_multi"
+input_nx = 402
+input_ny = 402
+input_nt = 20
+input_outdir = "docs/frames/baseline"
 input_do_viz = false
+input_benchmark = false
 
 for i in 1:length(ARGS)
     if ARGS[i] == "--nx"
@@ -1647,15 +1292,13 @@ for i in 1:length(ARGS)
         global input_outdir = ARGS[i+1]
     elseif ARGS[i] == "--viz"
         global input_do_viz = true
-    elseif ARGS[i] == "--dt_multiplier"
-        global nt_nx_multiplier = parse(Float64, ARGS[i+1])
+    elseif ARGS[i] == "--benchmark"
+        global input_benchmark = true
     end
 end
 
-swe2d_topography_frames(input_nx, input_ny; nt=input_nt,
+run_baseline(input_nx, input_ny; nt=input_nt,
     outdir = input_outdir,
-    do_viz = input_do_viz,
-    print_error_metrics = false,
-    gpu_test_memory_restriction_workound = true,
-    domain_expansion_factor = 3.0
+    do_viz = input_do_viz && !input_benchmark,
+    benchmark = input_benchmark
 )
