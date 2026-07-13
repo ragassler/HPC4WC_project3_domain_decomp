@@ -11,6 +11,7 @@ import ParallelStencil: @reset_parallel_stencil
 
 @static if USE_GPU
     @init_parallel_stencil(CUDA, Float64, 2, inbounds=false)
+    CUDA.allowscalar(false)
 else
     @init_parallel_stencil(Threads, Float64, 2, inbounds=false)
     if !CLI_BENCHMARK_MODE
@@ -336,6 +337,26 @@ end
     h[ix, iy] > h_eps ?
         abs(hv[ix, iy] / h[ix, iy]) + sqrt(g * h[ix, iy]) :
         0.0
+
+
+@inline function make_send_buffer(A_slice)
+    buffer = copy(A_slice)
+
+    @static if USE_GPU
+        CUDA.synchronize()
+    end
+
+    return buffer
+end
+
+@inline function backend_synchronize()
+    @static if USE_GPU
+        CUDA.synchronize()
+    end
+
+    return nothing
+end
+
 
 const g = 1.0
 
@@ -1018,65 +1039,196 @@ end
     return (iy - 1) * dy
 end
 
-function update_halo_scalar!(A, comm_cart, neighbors_x, neighbors_y, tag_base)
-    # DIFF manual/baseline: manual replacement for IGG update_halo!. This is a
-    # blocking Sendrecv halo exchange, not hidden/overlapped communication.
+"""
+Allocate reusable send and receive buffers for one 2D field.
+
+Left/right boundaries contain ny values.
+Bottom/top boundaries contain nx values.
+
+`similar(A, ...)` creates CPU vectors when A is an Array and GPU vectors
+when A is a CuArray.
+"""
+function allocate_halo_buffers(A)
+    nx, ny = size(A)
+
+    allocate_vector(n) = similar(A, eltype(A), (n,))
+
+    return (
+        send_left   = allocate_vector(ny),
+        recv_left   = allocate_vector(ny),
+        send_right  = allocate_vector(ny),
+        recv_right  = allocate_vector(ny),
+
+        send_bottom = allocate_vector(nx),
+        recv_bottom = allocate_vector(nx),
+        send_top    = allocate_vector(nx),
+        recv_top    = allocate_vector(nx),
+    )
+end
+
+function update_halo_scalar!(
+    A,
+    buffers,
+    comm_cart,
+    neighbors_x,
+    neighbors_y,
+    tag_base,
+)
     left, right = neighbors_x
     bottom, top = neighbors_y
 
-    send_left = copy(A[2, :])
-    recv_right = similar(send_left)
-    MPI.Sendrecv!(send_left, left, tag_base,
-                  recv_right, right, tag_base,
-                  comm_cart)
-    if right != MPI.PROC_NULL
-        A[end, :] .= recv_right
+    # -------------------------------------------------------------------------
+    # X-direction: pack reusable left/right buffers
+    # -------------------------------------------------------------------------
+
+    @views begin
+        buffers.send_left  .= A[2, :]
+        buffers.send_right .= A[end-1, :]
     end
 
-    send_right = copy(A[end-1, :])
-    recv_left = similar(send_right)
-    MPI.Sendrecv!(send_right, right, tag_base + 1,
-                  recv_left, left, tag_base + 1,
-                  comm_cart)
-    if left != MPI.PROC_NULL
-        A[1, :] .= recv_left
+    # Ensure GPU packing has completed before MPI reads the send buffers.
+    backend_synchronize()
+
+    # Send left interior boundary and receive right halo.
+    MPI.Sendrecv!(
+        buffers.send_left,
+        left,
+        tag_base,
+        buffers.recv_right,
+        right,
+        tag_base,
+        comm_cart,
+    )
+
+    # Send right interior boundary and receive left halo.
+    MPI.Sendrecv!(
+        buffers.send_right,
+        right,
+        tag_base + 1,
+        buffers.recv_left,
+        left,
+        tag_base + 1,
+        comm_cart,
+    )
+
+    # Unpack received x-direction halos.
+    @views begin
+        if right != MPI.PROC_NULL
+            A[end, :] .= buffers.recv_right
+        end
+
+        if left != MPI.PROC_NULL
+            A[1, :] .= buffers.recv_left
+        end
     end
 
-    send_bottom = copy(A[:, 2])
-    recv_top = similar(send_bottom)
-    MPI.Sendrecv!(send_bottom, bottom, tag_base + 2,
-                  recv_top, top, tag_base + 2,
-                  comm_cart)
-    if top != MPI.PROC_NULL
-        A[:, end] .= recv_top
+    # Complete unpacking before using the updated x halos or reusing buffers.
+    backend_synchronize()
+
+    # -------------------------------------------------------------------------
+    # Y-direction: pack reusable bottom/top buffers
+    # -------------------------------------------------------------------------
+
+    @views begin
+        buffers.send_bottom .= A[:, 2]
+        buffers.send_top    .= A[:, end-1]
     end
 
-    send_top = copy(A[:, end-1])
-    recv_bottom = similar(send_top)
-    MPI.Sendrecv!(send_top, top, tag_base + 3,
-                  recv_bottom, bottom, tag_base + 3,
-                  comm_cart)
-    if bottom != MPI.PROC_NULL
-        A[:, 1] .= recv_bottom
+    backend_synchronize()
+
+    # Send bottom interior boundary and receive top halo.
+    MPI.Sendrecv!(
+        buffers.send_bottom,
+        bottom,
+        tag_base + 2,
+        buffers.recv_top,
+        top,
+        tag_base + 2,
+        comm_cart,
+    )
+
+    # Send top interior boundary and receive bottom halo.
+    MPI.Sendrecv!(
+        buffers.send_top,
+        top,
+        tag_base + 3,
+        buffers.recv_bottom,
+        bottom,
+        tag_base + 3,
+        comm_cart,
+    )
+
+    # Unpack received y-direction halos.
+    @views begin
+        if top != MPI.PROC_NULL
+            A[:, end] .= buffers.recv_top
+        end
+
+        if bottom != MPI.PROC_NULL
+            A[:, 1] .= buffers.recv_bottom
+        end
     end
+
+    backend_synchronize()
 
     return nothing
 end
 
-function update_halo!(h, hu, hv, comm_cart, neighbors_x, neighbors_y)
-    # DIFF manual/baseline: baseline.jl calls update_halo!(h, hu, hv) from IGG.
-    # Here we exchange each field explicitly and pass communicator/neighbors.
-    update_halo_scalar!(h, comm_cart, neighbors_x, neighbors_y, 0)
-    update_halo_scalar!(hu, comm_cart, neighbors_x, neighbors_y, 10)
-    update_halo_scalar!(hv, comm_cart, neighbors_x, neighbors_y, 20)
+function update_halo!(
+    h,
+    hu,
+    hv,
+    buffers,
+    comm_cart,
+    neighbors_x,
+    neighbors_y,
+)
+    update_halo_scalar!(
+        h,
+        buffers,
+        comm_cart,
+        neighbors_x,
+        neighbors_y,
+        0,
+    )
+
+    update_halo_scalar!(
+        hu,
+        buffers,
+        comm_cart,
+        neighbors_x,
+        neighbors_y,
+        10,
+    )
+
+    update_halo_scalar!(
+        hv,
+        buffers,
+        comm_cart,
+        neighbors_x,
+        neighbors_y,
+        20,
+    )
 
     return nothing
 end
 
-function update_halo_dt_drain!(dt_drain, comm_cart, neighbors_x, neighbors_y)
-    # DIFF manual/baseline: scalar dt_drain halo update implemented explicitly;
-    # baseline.jl uses IGG's update_halo!(dt_drain).
-    update_halo_scalar!(dt_drain, comm_cart, neighbors_x, neighbors_y, 30)
+function update_halo_dt_drain!(
+    dt_drain,
+    buffers,
+    comm_cart,
+    neighbors_x,
+    neighbors_y,
+)
+    update_halo_scalar!(
+        dt_drain,
+        buffers,
+        comm_cart,
+        neighbors_x,
+        neighbors_y,
+        30,
+    )
+
     return nothing
 end
 
@@ -1089,7 +1241,7 @@ end
     ly = 50.0
 
     # Choose 2D MPI topology.
-    dims_mpi = [1, 4]
+    dims_mpi = [2, 2]
 
     if (nx_global - 2) % dims_mpi[1] != 0 || (ny_global - 2) % dims_mpi[2] != 0
         error("nx_global-2 and ny_global-2 must be divisible by the MPI topology.")
@@ -1218,6 +1370,8 @@ end
 
     dt_drain = @zeros(nx, ny)
 
+    halo_buffers = allocate_halo_buffers(h)
+
     dtFx = @zeros(nx - 1, ny)
     dtGy = @zeros(nx, ny - 1)
     
@@ -1305,7 +1459,13 @@ end
         )
         # DIFF manual/baseline: explicit scalar halo update with Sendrecv.
         # baseline.jl calls IGG update_halo!(dt_drain).
-        update_halo_dt_drain!(dt_drain, comm_cart, neighbors_x, neighbors_y)
+        update_halo_dt_drain!(
+            dt_drain,
+            halo_buffers,
+            comm_cart,
+            neighbors_x,
+            neighbors_y,
+        )
 
         
         @parallel compute_effective_flux_timesteps!(
@@ -1323,7 +1483,15 @@ end
         )           
         # DIFF manual/baseline: explicit h/hu/hv halo exchange. This is
         # blocking communication; no hidden/overlapped communication yet.
-        update_halo!(h, hu, hv, comm_cart, neighbors_x, neighbors_y)
+        update_halo!(
+            h,
+            hu,
+            hv,
+            halo_buffers,
+            comm_cart,
+            neighbors_x,
+            neighbors_y,
+        )
 
 
         @parallel dry_cell_fix!(h, hu, hv, hmin)
@@ -1412,9 +1580,9 @@ end
 end
 
 function main()
-    input_nx = 402
-    input_ny = 402
-    input_nt = 20
+    input_nx = 802
+    input_ny = 802
+    input_nt = 200
     input_outdir = "docs/frames/baseline"
     input_do_viz = true
     input_benchmark = false

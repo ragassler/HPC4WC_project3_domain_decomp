@@ -1164,17 +1164,16 @@ Run the simple 2D SWE baseline with IGG domain decomposition.
             max_speed_x, max_speed_y, vel_eps
         )
 
-        @parallel compute_draining_timestep!(
-            dt_drain,
-            F₁, G₁,
-            h,
-            dt,
-            _dx, _dy
-        )
-        # DIFF baseline/manual: IGG provides this halo update. manual.jl calls
-        # update_halo_dt_drain!(..., comm_cart, neighbors_x, neighbors_y), which
-        # is implemented with explicit MPI.Sendrecv!.
-        update_halo!(dt_drain)
+        @hide_communication b_width begin
+            @parallel compute_draining_timestep!(
+                dt_drain,
+                F₁, G₁,
+                h,
+                dt,
+                _dx, _dy
+            )
+            update_halo!(dt_drain)
+        end
 
         
         @parallel compute_effective_flux_timesteps!(
@@ -1184,15 +1183,14 @@ Run the simple 2D SWE baseline with IGG domain decomposition.
             dt
         )
         
-        @parallel update_height_momentum!(
-            h, hu, hv,
-            F₁, G₁, F₂, F₃, G₂, G₃, dtFx, dtGy,
-            z, g, dt, _dx, _dy
-        )           
-        # DIFF baseline/manual: same operation conceptually, but baseline lets
-        # IGG exchange all halos. manual.jl exchanges h/hu/hv with explicit
-        # blocking Sendrecv calls.
-        update_halo!(h, hu, hv)
+        @hide_communication b_width begin
+            @parallel update_height_momentum!(
+                h, hu, hv,
+                F₁, G₁, F₂, F₃, G₂, G₃, dtFx, dtGy,
+                z, g, dt, _dx, _dy
+            )           
+            update_halo!(h, hu, hv)
+        end
 
         @parallel dry_cell_fix!(h, hu, hv, hmin)
 
@@ -1274,9 +1272,9 @@ Run the simple 2D SWE baseline with IGG domain decomposition.
 
 end
 
-input_nx = 402
-input_ny = 402
-input_nt = 20
+input_nx = 802
+input_ny = 802
+input_nt = 200
 input_outdir = "docs/frames/baseline"
 input_do_viz = false
 input_benchmark = false
