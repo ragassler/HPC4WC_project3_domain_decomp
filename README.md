@@ -57,19 +57,21 @@ Both `src/baseline.jl` and `src/manual.jl` accept the same command-line options:
 --outdir DIR    Directory for saved arrays and domain-decomposition metadata
 --viz           Save serialized field arrays for later plotting
 --benchmark     Run timing mode: no saved arrays, no progress output
+--topology PxQ  Manual solver only: MPI Cartesian topology (default 2x2)
+--warmup N      Manual benchmark warm-up iterations excluded from timing (default 5)
 ```
 
 Current script defaults:
 
 ```text
-baseline.jl: --nx 400 --ny 400 --nt 20 --outdir docs/frames/baseline
-manual.jl:   --nx 100 --ny 400 --nt 20 --outdir docs/frames/baseline
+baseline.jl: --nx 802 --ny 802 --nt 200 --outdir docs/frames/baseline
+manual.jl:   --nx 802 --ny 402 --nt 200 --outdir docs/frames/baseline
 ```
 
 `baseline.jl` lets `ImplicitGlobalGrid.jl`/MPI choose a compact Cartesian
-topology from the number of MPI ranks. `manual.jl` is still fixed to `2 x 2`,
-so manual runs must use 4 MPI ranks. In both cases, the global interior size
-`nx - 2` by `ny - 2` must be divisible by the chosen topology.
+topology from the number of MPI ranks. `manual.jl` accepts its topology with
+`--topology PXxPY` and must use `PX * PY` MPI ranks. In both cases, the global
+interior size `nx - 2` by `ny - 2` must be divisible by the chosen topology.
 
 ## Run Baseline
 
@@ -105,7 +107,7 @@ BENCHMARK walltime_seconds=... nt=... global_size=... local_size=... nprocs=... 
 communicator, global indexing, gather, and halo exchange manually with `MPI.jl`.
 
 ```bash
-mpiexec -n 4 julia --project src/manual.jl --nx 100 --ny 400 --nt 20
+mpiexec -n 4 julia --project src/manual.jl --topology 2x2 --nx 102 --ny 402 --nt 20
 ```
 
 Benchmark mode:
@@ -116,10 +118,9 @@ mpiexec -n 4 julia --project src/manual.jl --nx 500 --ny 500 --nt 100 --benchmar
 
 Current limitations of `manual.jl`:
 
-- Fixed `2 x 2` decomposition, therefore exactly 4 MPI ranks.
 - Uniform local block sizes only.
 - Blocking halo exchange only; no hidden communication yet.
-- CPU backend only unless `USE_GPU` and the communication path are extended.
+- CPU backend by default; set `USE_GPU=true` to select the CUDA backend.
 
 ## Save And Plot Field Arrays
 
@@ -183,8 +184,29 @@ mpiexec -n 4 julia --project src/manual.jl --nx 500 --ny 500 --nt 100 --benchmar
 
 The repository also contains helper scripts in `run_files/`, but check them
 before submitting because cluster account, module/uenv setup, number of tasks,
-and GPU-related environment variables are machine-specific. The current solver
-files are configured for CPU runs.
+and GPU-related environment variables are machine-specific. Solvers use the CPU
+backend by default; the CSCS scripts set `USE_GPU=true` for CUDA.
+
+Topology/thread and aspect-ratio benchmark sweeps can be run locally with:
+
+```bash
+./run_files/run_manual_threads.sh 2x2
+./run_files/run_manual_aspect_ratios.sh 2x2
+```
+
+The first command tests 1, 2, 4, and 8 Julia threads by default. The second
+uses 8 threads and tests interior-grid ratios 1:8, 1:4, 1:2, and 1:1. Results
+are written below `out/` with topology, thread count, and ratio labels. Use
+environment variables printed by each script's usage message to override the
+defaults.
+
+On CSCS, the matching scripts submit themselves and calculate the required
+MPI ranks, nodes, and GPUs from the topology:
+
+```bash
+./run_files/submit_manual_threads_cscs.sh 2x2
+./run_files/submit_manual_aspect_ratios_cscs.sh 2x2
+```
 
 ## Implementation Notes
 
@@ -204,8 +226,6 @@ files are configured for CPU runs.
 
 Future work:
 
-- Make the topology configurable, for example `1x4`, `4x1`, or arbitrary
-  `px x py`.
 - Add nonblocking halo exchange and overlap with interior computation.
 - Re-enable/validate GPU execution once the manual communication path is ready.
 - Add comparison checks between `baseline.jl` and `manual.jl`.

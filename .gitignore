@@ -5,6 +5,7 @@
 *.h5
 *.hdf5
 *.nc
+*.log
 
 # Generated plots
 plots/

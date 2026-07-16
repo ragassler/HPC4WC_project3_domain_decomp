@@ -4,7 +4,7 @@ import MPI
 
 
 const CLI_BENCHMARK_MODE = "--benchmark" in ARGS
-const USE_GPU = false
+const USE_GPU = lowercase(get(ENV, "USE_GPU", "false")) in ("1", "true", "yes")
 using ParallelStencil
 using ParallelStencil.FiniteDifferences2D
 import ParallelStencil: @reset_parallel_stencil
@@ -1236,12 +1236,17 @@ end
             nt=20,
             outdir="frames",
             do_viz=false,
-            benchmark=false)
+            benchmark=false,
+            topology=(2, 2),
+            warmup=5)
     lx = 50.0
     ly = 50.0
 
     # Choose 2D MPI topology.
-    dims_mpi = [2, 2]
+    dims_mpi = collect(topology)
+    if length(dims_mpi) != 2 || any(dims_mpi .< 1)
+        error("MPI topology must contain two positive dimensions, got $topology.")
+    end
 
     if (nx_global - 2) % dims_mpi[1] != 0 || (ny_global - 2) % dims_mpi[2] != 0
         error("nx_global-2 and ny_global-2 must be divisible by the MPI topology.")
@@ -1416,6 +1421,12 @@ end
     # main loop
     # -------------------------------------------------------------------------
 
+    warmup_steps = benchmark ? warmup : 0
+    if warmup_steps < 0
+        error("The number of warm-up iterations must be non-negative, got $warmup_steps.")
+    end
+    total_steps = warmup_steps + nt
+
     dt = 0.0
     loop_walltime = 0.0
 
@@ -1423,7 +1434,15 @@ end
     MPI.Barrier(comm_cart)
     loop_t0 = time_ns()
 
-    for it in 1:nt
+    for it in 1:total_steps
+        # Warm-up iterations compile the kernels and establish steady execution
+        # state. Synchronize all ranks before starting the benchmark timer.
+        if benchmark && warmup_steps > 0 && it == warmup_steps + 1
+            @synchronize()
+            MPI.Barrier(comm_cart)
+            loop_t0 = time_ns()
+        end
+
         @parallel compute_maxspeed!(max_speed_x, max_speed_y, h, hu, hv, z, g, vel_eps)
         
         if !benchmark && 0.99 / (maximum(max_speed_x) * _dx + maximum(max_speed_y) * _dy) < dt 
@@ -1545,6 +1564,7 @@ end
                 "BENCHMARK ",
                 "walltime_seconds=", @sprintf("%.9f", loop_walltime), " ",
                 "nt=", nt, " ",
+                "warmup=", warmup_steps, " ",
                 "global_size=", nx_global, "x", ny_global, " ",
                 "local_size=", nx, "x", ny, " ",
                 "nprocs=", nprocs, " ",
@@ -1581,11 +1601,13 @@ end
 
 function main()
     input_nx = 802
-    input_ny = 802
+    input_ny = 402
     input_nt = 200
     input_outdir = "docs/frames/baseline"
     input_do_viz = true
     input_benchmark = false
+    input_topology = (2, 2)
+    input_warmup = 5
 
     for i in 1:length(ARGS)
         if ARGS[i] == "--nx"
@@ -1600,13 +1622,23 @@ function main()
             input_do_viz = true
         elseif ARGS[i] == "--benchmark"
             input_benchmark = true
+        elseif ARGS[i] == "--topology"
+            topology_parts = split(lowercase(ARGS[i+1]), 'x')
+            if length(topology_parts) != 2
+                error("--topology must have the form PXxPY, for example 2x2.")
+            end
+            input_topology = (parse(Int, topology_parts[1]), parse(Int, topology_parts[2]))
+        elseif ARGS[i] == "--warmup"
+            input_warmup = parse(Int, ARGS[i+1])
         end
     end
 
     run_baseline(input_nx, input_ny; nt=input_nt,
         outdir = input_outdir,
         do_viz = input_do_viz && !input_benchmark,
-        benchmark = input_benchmark
+        benchmark = input_benchmark,
+        topology = input_topology,
+        warmup = input_warmup
     )
 end
 
