@@ -1,0 +1,4 @@
+solver,nprocs,topology,nx_global,ny_global,nx_local,ny_local,nt,walltime,steps_per_second,cell_updates_per_second
+igg_baseline,4,2x2,802,202,402,102,20,4.213892708,4.746205,7.689042e+05
+igg_baseline,4,2x2,802,202,402,102,20,4.217824292,4.741781,7.681875e+05
+igg_baseline,4,2x2,802,202,402,102,20,4.324138333,4.625199,7.493007e+05

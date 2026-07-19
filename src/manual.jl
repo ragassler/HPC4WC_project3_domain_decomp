@@ -1009,7 +1009,7 @@ end
 
 """
     run_baseline(nx_global, ny_global; nt=20, outdir="frames",
-                 do_viz=false, benchmark=false)
+                 do_viz=false, benchmark=false, benchdir = "frames")
 
 Run the simple 2D SWE baseline with IGG domain decomposition.
 """
@@ -1238,7 +1238,8 @@ end
             do_viz=false,
             benchmark=false,
             topology=(2, 2),
-            warmup=5)
+            warmup=5,
+            benchdir = "frames")
     lx = 50.0
     ly = 50.0
 
@@ -1560,17 +1561,37 @@ end
         if me == 0
             cells_per_step = nx_global * ny_global
             cell_updates_per_second = cells_per_step * nt / loop_walltime
-            println(
-                "BENCHMARK ",
-                "walltime_seconds=", @sprintf("%.9f", loop_walltime), " ",
-                "nt=", nt, " ",
-                "warmup=", warmup_steps, " ",
-                "global_size=", nx_global, "x", ny_global, " ",
-                "local_size=", nx, "x", ny, " ",
-                "nprocs=", nprocs, " ",
-                "steps_per_second=", @sprintf("%.6f", nt / loop_walltime), " ",
-                "cell_updates_per_second=", @sprintf("%.6e", cell_updates_per_second)
-            )
+            
+            # path of simulation benchmarks
+            log_filename = joinpath(benchdir, "simulation_benchmarks.csv")
+            # check if file exists
+            file_exists = isfile(log_filename)
+            
+            open(log_filename, "a") do io
+                if !file_exists
+                    # write header if file does not exist
+                    println(io, "solver,nprocs,topology,nx_global,ny_global,nx_local,ny_local,nt,walltime,steps_per_second,cell_updates_per_second")
+                end
+                
+                solver_type = "manual" 
+                topology_str = "$(dims_mpi[1])x$(dims_mpi[2])"
+                
+                # write to file 
+                @printf(io, "%s,%d,%s,%d,%d,%d,%d,%d,%.9f,%.6f,%.6e\n",
+                    solver_type,
+                    nprocs,
+                    topology_str,
+                    nx_global,
+                    ny_global,
+                    nx, # nx_local inkl. Halos
+                    ny, # ny_local inkl. Halos
+                    nt,
+                    loop_walltime,
+                    nt / loop_walltime,
+                    cell_updates_per_second
+                )
+            end
+            println("Benchmark-metrics saved to: $log_filename")
         end
 
         # DIFF manual/baseline: finalize MPI only if this function initialized
@@ -1603,7 +1624,8 @@ function main()
     input_nx = 802
     input_ny = 402
     input_nt = 200
-    input_outdir = "docs/frames/baseline"
+    input_outdir = "docs/frames/manual"
+    input_benchdir = "docs/benchmark"
     input_do_viz = true
     input_benchmark = false
     input_topology = (2, 2)
@@ -1618,6 +1640,8 @@ function main()
             input_nt = parse(Int, ARGS[i+1])
         elseif ARGS[i] == "--outdir"
             input_outdir = ARGS[i+1]
+        elseif ARGS[i] == "--benchdir"
+            input_benchdir = ARGS[i+1]
         elseif ARGS[i] == "--viz"
             input_do_viz = true
         elseif ARGS[i] == "--benchmark"
@@ -1638,7 +1662,8 @@ function main()
         do_viz = input_do_viz && !input_benchmark,
         benchmark = input_benchmark,
         topology = input_topology,
-        warmup = input_warmup
+        warmup = input_warmup,
+        benchdir = input_benchdir
     )
 end
 

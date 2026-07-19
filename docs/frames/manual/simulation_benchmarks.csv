@@ -1,0 +1,2 @@
+solver,nprocs,topology,nx_global,ny_global,nx_local,ny_local,nt,walltime,steps_per_second,cell_updates_per_second
+manual,4,1x4,802,202,802,52,20,0.154915750,129.102431,2.091511e+07

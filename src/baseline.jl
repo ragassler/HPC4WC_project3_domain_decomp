@@ -959,7 +959,8 @@ Run the simple 2D SWE baseline with IGG domain decomposition.
             nt=20,
             outdir="frames",
             do_viz=false,
-            benchmark=false)
+            benchmark=false,
+            benchdir = "benchmark")
     lx = 50.0
     ly = 50.0
 
@@ -1239,16 +1240,37 @@ Run the simple 2D SWE baseline with IGG domain decomposition.
         if me == 0
             cells_per_step = nx_g() * ny_g()
             cell_updates_per_second = cells_per_step * nt / loop_walltime
-            println(
-                "BENCHMARK ",
-                "walltime_seconds=", @sprintf("%.9f", loop_walltime), " ",
-                "nt=", nt, " ",
-                "global_size=", nx_g(), "x", ny_g(), " ",
-                "local_size=", nx, "x", ny, " ",
-                "nprocs=", nprocs, " ",
-                "steps_per_second=", @sprintf("%.6f", nt / loop_walltime), " ",
-                "cell_updates_per_second=", @sprintf("%.6e", cell_updates_per_second)
-            )
+            
+            # path of simulation benchmarks
+            log_filename = joinpath(benchdir, "simulation_benchmarks.csv")
+            # check if file exists
+            file_exists = isfile(log_filename)
+            
+            open(log_filename, "a") do io
+                if !file_exists
+                    # write header if file does not exist
+                    println(io, "solver,nprocs,topology,nx_global,ny_global,nx_local,ny_local,nt,walltime,steps_per_second,cell_updates_per_second")
+                end
+                
+                solver_type = "igg_baseline" 
+                topology_str = "$(dims_mpi[1])x$(dims_mpi[2])"
+                
+                # write to file 
+                @printf(io, "%s,%d,%s,%d,%d,%d,%d,%d,%.9f,%.6f,%.6e\n",
+                    solver_type,
+                    nprocs,
+                    topology_str,
+                    nx_g(),
+                    ny_g(),
+                    nx, # nx_local inkl. Halos
+                    ny, # ny_local inkl. Halos
+                    nt,
+                    loop_walltime,
+                    nt / loop_walltime,
+                    cell_updates_per_second
+                )
+            end
+            println("Benchmark-metrics saved to: $log_filename")
         end
         # DIFF baseline/manual: IGG owns grid teardown here. manual.jl finalizes
         # MPI only if it initialized MPI itself.
@@ -1276,6 +1298,7 @@ input_nx = 802
 input_ny = 802
 input_nt = 200
 input_outdir = "docs/frames/baseline"
+input_benchdir = "docs/benchmark"
 input_do_viz = false
 input_benchmark = false
 
@@ -1288,6 +1311,8 @@ for i in 1:length(ARGS)
         global input_nt = parse(Int, ARGS[i+1])
     elseif ARGS[i] == "--outdir"
         global input_outdir = ARGS[i+1]
+    elseif ARGS[i] == "--benchdir"
+        global input_benchdir = ARGS[i+1]
     elseif ARGS[i] == "--viz"
         global input_do_viz = true
     elseif ARGS[i] == "--benchmark"
@@ -1298,5 +1323,5 @@ end
 run_baseline(input_nx, input_ny; nt=input_nt,
     outdir = input_outdir,
     do_viz = input_do_viz && !input_benchmark,
-    benchmark = input_benchmark
-)
+    benchmark = input_benchmark,
+    benchdir =  input_benchdir)
