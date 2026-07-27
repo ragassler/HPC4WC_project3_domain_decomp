@@ -4,8 +4,8 @@
 # PARAMETER-EINSTELLUNGEN
 # Hier kannst du deine Simulationen für alle Durchläufe zentral anpassen:
 # ==============================================================================
-NX=802
-NY=402
+NX=402
+NY=802
 NT=20
 PROCS=8
 
