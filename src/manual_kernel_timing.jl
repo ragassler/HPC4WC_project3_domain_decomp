@@ -1,5 +1,3 @@
-using CSV
-using DataFrames
 using Serialization
 
 import MPI
@@ -1011,11 +1009,15 @@ end
 
 """
     run_baseline(nx_global, ny_global; nt=20, outdir="frames",
-                 do_viz=false, benchmark=false)
+                 do_viz=false, benchmark=false, benchdir=..., topology=(2,2),
+                 warmup=5)
 
-Run the simple 2D SWE baseline with IGG domain decomposition.
+Run the manual SWE solver with per-iteration kernel timing.
+
+Times only the compute kernels (the @parallel/@parallel_indices calls),
+excluding the MPI halo exchanges (update_halo_dt_drain!, update_halo!).
+The timer uses pause/resume around the two halo exchanges.
 """
-
 @views function get_global_indices(nx, ny, coords)
     # DIFF manual/baseline: manual replacement for IGG's x_g/y_g global-index
     # mapping. These ranges include halo cells, so neighboring ranks overlap by
@@ -1239,8 +1241,10 @@ end
             outdir="frames",
             do_viz=false,
             benchmark=false,
+            benchdir = "docs/benchmark/kernel_timing_v1.csv",
             topology=(2, 2),
             warmup=5)
+
     lx = 50.0
     ly = 50.0
 
@@ -1276,7 +1280,7 @@ end
 
     # DIFF manual/baseline: explicit neighbor lookup. baseline.jl only needs
     # coords from IGG and calls IGG's update_halo! later.
-    neighbors_x = MPI.Cart_shift(comm_cart, 0, 1) 
+    neighbors_x = MPI.Cart_shift(comm_cart, 0, 1)
     neighbors_y = MPI.Cart_shift(comm_cart, 1, 1)
 
     # DIFF manual/baseline: physical-boundary ranks are detected from missing
@@ -1286,16 +1290,12 @@ end
     is_bottom = neighbors_y[1] == MPI.PROC_NULL
     is_top    = neighbors_y[2] == MPI.PROC_NULL
 
-    b_width     = (8, 8, 0)
-
     if me == 0 && !benchmark
         println("Global domain size (including halos): ", nx_global, " x ", ny_global)
         println("MPI topology: ", dims_mpi[1], " x ", dims_mpi[2])
         println("Local domain size (including halos): ", nx, " x ", ny)
         println("Time steps: ", nt)
     end
-
-    nvis = 5
 
     # DIFF manual/baseline: no IGG nx_g()/ny_g() helpers here; use the explicit
     # input global sizes.
@@ -1312,6 +1312,7 @@ end
     ix_roi = 2:(nx_global - 1)
     iy_roi = 2:(ny_global - 1)
 
+    # If not in benchmark mode: save domain decomposition and return early.
     if !benchmark
         save_domain_decomposition!(outdir;
             me = me,
@@ -1331,8 +1332,8 @@ end
             ix_roi = ix_roi,
             iy_roi = iy_roi,
         )
+        return nothing
     end
-
 
     # DIFF manual/baseline: build halo-inclusive coordinate arrays manually.
     # baseline.jl uses IGG's x_g/y_g mapping directly.
@@ -1373,7 +1374,6 @@ end
     η0 = Data.Array(η0_local)
 
     hmin  = 1e-2
-    h .= max.(0.0, η0 .- z)
 
     dt_drain = @zeros(nx, ny)
 
@@ -1381,83 +1381,98 @@ end
 
     dtFx = @zeros(nx - 1, ny)
     dtGy = @zeros(nx, ny - 1)
-    
-    time = 0.0
 
     # -------------------------------------------------------------------------
-    # visualization
+    # reset_fields! -- re-initialise all fields to the initial condition with
+    # consistent halos and boundary conditions.
     # -------------------------------------------------------------------------
+    function reset_fields!()
+        h .= max.(0.0, η0 .- z)
+        hu .= 0.0
+        hv .= 0.0
+        F₁ .= 0.0; F₂ .= 0.0; F₃ .= 0.0
+        G₁ .= 0.0; G₂ .= 0.0; G₃ .= 0.0
+        max_speed_x .= 0.0; max_speed_y .= 0.0
+        dt_drain .= 0.0; dtFx .= 0.0; dtGy .= 0.0
 
-    if do_viz && !benchmark
-        if me == 0
-            println("Using visualization: Array output")
-        end
-        mkpath(outdir)
-        
-        nx_v, ny_v = (nx - 2) * dims[1], (ny - 2) * dims[2]
-        h_v = zeros(nx_v, ny_v)
-        z_v = zeros(nx_v, ny_v)
-        h_inn = zeros(nx - 2, ny - 2)
-        z_inn = zeros(nx - 2, ny - 2)
-        h_inn .= Array(h)[2:end-1, 2:end-1]; gather_global_array_manual!(h_inn, h_v, comm_cart)
-        z_inn .= Array(z)[2:end-1, 2:end-1]; gather_global_array_manual!(z_inn, z_v, comm_cart)
+        update_halo!(h, hu, hv, halo_buffers, comm_cart, neighbors_x, neighbors_y)
 
-        if me == 0
-            frame_id = Ref(0)
-            @info "Saving arrays to $outdir"
-            function save_array!()
-                frame_id[] += 1
-                fname = joinpath(outdir, @sprintf("array_frame_%06d.jls", frame_id[]))
-                serialize(fname, (h=Array(convert.(Float32, h_v)),))
-            end
-            function save_array_with_z!()
-                frame_id[] += 1
-                fname = joinpath(outdir, @sprintf("array_frame_%06d.jls", frame_id[]))
-                serialize(fname, (h=Array(convert.(Float32, h_v)), z=Array(convert.(Float32, z_v))))
-            end
-            save_array_with_z!()
-        end
+        if is_left;   @parallel (1:ny) left_bc!(h, hu, hv, g, 0.0, _dx);   end
+        if is_right;  @parallel (1:ny) right_bc!(h, hu, hv, g, 0.0, _dx);  end
+        if is_bottom; @parallel (1:nx) bottom_bc!(h, hu, hv, g, 0.0, _dy); end
+        if is_top;    @parallel (1:nx) top_bc!(h, hu, hv, g, 0.0, _dy);    end
+
+        @parallel dry_cell_fix!(h, hu, hv, hmin)
+        @synchronize()
+
+        return nothing
     end
 
     # -------------------------------------------------------------------------
-    # main loop
+    # Warmup phase
     # -------------------------------------------------------------------------
-
-    warmup_steps = benchmark ? warmup : 0
-    if warmup_steps < 0
-        error("The number of warm-up iterations must be non-negative, got $warmup_steps.")
-    end
-    total_steps = warmup_steps + nt
-
-    dt = 0.0
-    loop_walltime = 0.0
-    loop_walltimes = Float64[]  # Array to store walltime for each iteration
-
-    @synchronize()
-    MPI.Barrier(comm_cart)
-    loop_t0 = time_ns()
-
-    for it in 1:total_steps
-
-
+    if warmup > 0
+        reset_fields!()
         @parallel compute_maxspeed!(max_speed_x, max_speed_y, h, hu, hv, z, g, vel_eps)
-        
-        if !benchmark && 0.99 / (maximum(max_speed_x) * _dx + maximum(max_speed_y) * _dy) < dt 
-            println("Warning: Local dt = ", 0.99 / (maximum(max_speed_x) * _dx + maximum(max_speed_y) * _dy), " is bigger than the current CLF, at iteration ", it)
+        dt_warm = 0.9 / (max_g(max_speed_x, comm_cart) * _dx + max_g(max_speed_y, comm_cart) * _dy)
+
+        for it in 1:warmup
+            @parallel compute_maxspeed!(max_speed_x, max_speed_y, h, hu, hv, z, g, vel_eps)
+            @parallel compute_1st_2nd_and_3th_flux!(F₁, F₂, F₃, G₁, G₂, G₃, hu, hv, h, z, g, max_speed_x, max_speed_y, vel_eps)
+            @parallel compute_draining_timestep!(dt_drain, F₁, G₁, h, dt_warm, _dx, _dy)
+            update_halo_dt_drain!(dt_drain, halo_buffers, comm_cart, neighbors_x, neighbors_y)
+            @parallel compute_effective_flux_timesteps!(dtFx, dtGy, dt_drain, F₁, G₁, dt_warm)
+            @parallel update_height_momentum!(h, hu, hv, F₁, G₁, F₂, F₃, G₂, G₃, dtFx, dtGy, z, g, dt_warm, _dx, _dy)
+            update_halo!(h, hu, hv, halo_buffers, comm_cart, neighbors_x, neighbors_y)
+
+            if is_left;   @parallel (1:ny) left_bc!(h, hu, hv, g, dt_warm, _dx);   end
+            if is_right;  @parallel (1:ny) right_bc!(h, hu, hv, g, dt_warm, _dx);  end
+            if is_bottom; @parallel (1:nx) bottom_bc!(h, hu, hv, g, dt_warm, _dy); end
+            if is_top;    @parallel (1:nx) top_bc!(h, hu, hv, g, dt_warm, _dy);    end
+
+            @parallel dry_cell_fix!(h, hu, hv, hmin)
         end
+
+        @synchronize()
+        MPI.Barrier(comm_cart)
+
+        reset_fields!()
+        @synchronize()
+        MPI.Barrier(comm_cart)
+    end
+
+    # -------------------------------------------------------------------------
+    # Benchmark with per-iteration kernel timing
+    # -------------------------------------------------------------------------
+    kernel_walltimes = Float64[]
+    iteration_numbers = Int[]
+
+    reset_fields!()
+    time = 0.0
+    dt = 0.0
+
+    for it in 1:nt
+
+        # ------------------------------------------------------------ Timer
+        # Time only the compute kernels (excludes MPI halo exchanges).
+        # Uses pause/resume around the two halo exchanges:
+        #   update_halo_dt_drain! and update_halo!
+        @synchronize()
+        MPI.Barrier(comm_cart)
+        t0 = time_ns()
+
+        # Phase 1: maxspeed (incl. dt Allreduce) + fluxes + draining
+        @parallel compute_maxspeed!(max_speed_x, max_speed_y, h, hu, hv, z, g, vel_eps)
 
         if it % 10 == 0 || it == 1
-            # DIFF manual/baseline: same global reduction idea, but manual.jl
-            # passes comm_cart explicitly. baseline.jl uses MPI.COMM_WORLD in
-            # its min_g/max_g helpers after IGG setup.
-            dt =  0.9 / (max_g(max_speed_x, comm_cart) * _dx + max_g(max_speed_y, comm_cart) * _dy)
+            dt = 0.9 / (max_g(max_speed_x, comm_cart) * _dx + max_g(max_speed_y, comm_cart) * _dy)
+        end
+
+        if !isfinite(dt)
+            error("Non-finite dt at iteration $it: dt=$dt")
         end
 
         time += dt
-
-        if !isfinite(dt)
-            error("Non-finite dt at iteration $it: dt=$dt, max_sx=$(maximum(max_speed_x)), max_sy=$(maximum(max_speed_y))")
-        end
 
         @parallel compute_1st_2nd_and_3th_flux!(
             F₁, F₂, F₃,
@@ -1473,8 +1488,10 @@ end
             dt,
             _dx, _dy
         )
-        # DIFF manual/baseline: explicit scalar halo update with Sendrecv.
-        # baseline.jl calls IGG update_halo!(dt_drain).
+
+        t1 = time_ns()
+
+        # --- halo exchange for dt_drain (NOT timed) ---
         update_halo_dt_drain!(
             dt_drain,
             halo_buffers,
@@ -1483,32 +1500,26 @@ end
             neighbors_y,
         )
 
-        
+        t2 = time_ns()
+
+        # Phase 2: effective flux timesteps + state update
         @parallel compute_effective_flux_timesteps!(
             dtFx, dtGy,
             dt_drain,
             F₁, G₁,
             dt
         )
-        
+
 
         @parallel update_height_momentum!(
             h, hu, hv,
             F₁, G₁, F₂, F₃, G₂, G₃, dtFx, dtGy,
             z, g, dt, _dx, _dy
-        )           
-        # DIFF manual/baseline: explicit h/hu/hv halo exchange. This is
-        # blocking communication; no hidden/overlapped communication yet.
+        )
 
+        t3 = time_ns()
 
-        # Warm-up iterations compile the kernels and establish steady execution
-        # state. Synchronize all ranks before starting the benchmark timer.
-        if benchmark && it > warmup_steps
-            @synchronize()
-            MPI.Barrier(comm_cart)
-            loop_t0 = time_ns()
-        end
-
+        # --- halo exchange for state (NOT timed) ---
         update_halo!(
             h,
             hu,
@@ -1519,16 +1530,11 @@ end
             neighbors_y,
         )
 
-        @synchronize()
-        loop_walltime = MPI.Allreduce((time_ns() - loop_t0) * 1e-9, MPI.MAX, comm_cart)
+        t4 = time_ns()
 
-        if benchmark && it > warmup_steps
-            push!(loop_walltimes, loop_walltime)  # Store walltime for this iteration
-        end
-
+        # Phase 3: dry cell fix + boundary conditions
         @parallel dry_cell_fix!(h, hu, hv, hmin)
 
-        # Apply BCs only on ranks that border the global domain boundaries
         if is_left
             @parallel (1:ny) left_bc!(h, hu, hv, g, dt, _dx)
         end
@@ -1544,87 +1550,49 @@ end
         if is_top
             @parallel (1:nx) top_bc!(h, hu, hv, g, dt, _dy)
         end
-        
+
         @parallel dry_cell_fix!(h, hu, hv, hmin)
 
-        if do_viz && !benchmark && it % nvis == 0
+        @synchronize()
+        t5 = time_ns()
 
-            # DIFF manual/baseline: output gather uses manual MPI.Gatherv!.
-            # baseline.jl calls IGG gather! here.
-            h_inn .= Array(h)[2:end-1, 2:end-1]; gather_global_array_manual!(h_inn, h_v, comm_cart)
-            z_inn .= Array(z)[2:end-1, 2:end-1]; gather_global_array_manual!(z_inn, z_v, comm_cart)
+        total_kernel_ns = (t1 - t0) + (t3 - t2) + (t5 - t4)
+        kernel_wtime = MPI.Allreduce(total_kernel_ns * 1e-9, MPI.MAX, comm_cart)
+        push!(kernel_walltimes, kernel_wtime)
+        push!(iteration_numbers, it)
+        # ------------------------------------------------------------ Timer
+    end
 
-            if me == 0
-                save_array!()
+    # -------------------------------------------------------------------------
+    # Write per-iteration kernel wall times to CSV
+    # -------------------------------------------------------------------------
+    if benchmark && me == 0
+        mkpath(dirname(benchdir))
+
+        topology_str = "$(dims_mpi[1])x$(dims_mpi[2])"
+
+        file_exists = isfile(benchdir)
+        open(benchdir, "a") do io
+            if !file_exists
+                println(io, "solver,nprocs,topology,nx_global,ny_global,nx_local,ny_local,iteration,kernel_walltime_seconds")
+            end
+            for idx in eachindex(kernel_walltimes)
+                @printf(io, "manual_kernel,%d,%s,%d,%d,%d,%d,%d,%.9f\n",
+                    nprocs, topology_str,
+                    nx_global, ny_global, nx, ny,
+                    iteration_numbers[idx],
+                    kernel_walltimes[idx])
             end
         end
-        
-        if me == 0 && !benchmark
-            percent = 100 * it / nt
-            print("\rProgress: $(round(percent, digits=1)) %")
-            flush(stdout)
-        end
+
+        println("All $(length(kernel_walltimes)) kernel wall times saved to: $benchdir")
     end
 
-
-
-    if benchmark
-        if me == 0
-            cells_per_step = nx_global * ny_global
-            cell_updates_per_second = cells_per_step * nt / loop_walltime
-            println(
-                "BENCHMARK ",
-                "walltime_seconds=", @sprintf("%.9f", loop_walltime), " ",
-                "nt=", nt, " ",
-                "warmup=", warmup_steps, " ",
-                "global_size=", nx_global, "x", ny_global, " ",
-                "local_size=", nx, "x", ny, " ",
-                "nprocs=", nprocs, " ",
-                "steps_per_second=", @sprintf("%.6f", nt / loop_walltime), " ",
-                "cell_updates_per_second=", @sprintf("%.6e", cell_updates_per_second)
-            )
-        end
-
-        # DIFF manual/baseline: finalize MPI only if this function initialized
-        # it. baseline.jl calls IGG finalize_global_grid().
-        if owns_mpi
-            MPI.Finalize()
-        end
-        # Save loop walltimes before returning
-        if me == 0
-            mkpath(outdir)
-            topo_str = "$(topology[1])x$(topology[2])"
-            fname = joinpath(outdir, "loop_walltimes_halo_$(topo_str).csv")
-            df = DataFrame(walltime_seconds=loop_walltimes)
-            CSV.write(fname, df)
-            @info "Saved loop walltimes to $fname"
-        end
-        return loop_walltime
-    end
-
-    if me == 0
-        println("\nSimulation completed.")
-        println("Total simulation time: $(round(time, digits=2)) seconds")
-
-        if do_viz
-            println("\nSaved $(frame_id[]) frames to: $(abspath(outdir))") 
-        end
-        # Save loop walltimes
-        mkpath(outdir)
-        topo_str = "$(topology[1])x$(topology[2])"
-        fname = joinpath(outdir, "loop_walltimes_halo_$(topo_str).csv")
-        df = DataFrame(walltime_seconds=loop_walltimes)
-        CSV.write(fname, df)
-        @info "Saved loop walltimes to $fname"
-    end
-
-    # DIFF manual/baseline: finalize MPI only if this function initialized it.
-    # baseline.jl calls IGG finalize_global_grid().
     if owns_mpi
         MPI.Finalize()
     end
-    return loop_walltime
 
+    return nothing
 end
 
 function main()
@@ -1632,8 +1600,9 @@ function main()
     input_ny = 402
     input_nt = 200
     input_outdir = "docs/frames/manual"
-    input_do_viz = true
-    input_benchmark = false
+    input_benchdir = "docs/benchmark/kernel_timing_v1.csv"
+    input_do_viz = false
+    input_benchmark = true
     input_topology = (2, 2)
     input_warmup = 5
 
@@ -1658,12 +1627,15 @@ function main()
             input_topology = (parse(Int, topology_parts[1]), parse(Int, topology_parts[2]))
         elseif ARGS[i] == "--warmup"
             input_warmup = parse(Int, ARGS[i+1])
+        elseif ARGS[i] == "--benchdir"
+            input_benchdir = ARGS[i+1]
         end
     end
 
     run_baseline(input_nx, input_ny; nt=input_nt,
         outdir = input_outdir,
         do_viz = input_do_viz && !input_benchmark,
+        benchdir = input_benchdir,
         benchmark = input_benchmark,
         topology = input_topology,
         warmup = input_warmup
