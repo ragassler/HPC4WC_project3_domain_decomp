@@ -6,6 +6,7 @@
 *.hdf5
 *.nc
 *.log
+*.toml
 
 # Generated plots
 plots/
