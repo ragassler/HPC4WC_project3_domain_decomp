@@ -357,6 +357,36 @@ end
     return nothing
 end
 
+@inline function gpu_event_time(f)
+    if USE_GPU
+        start = CUDA.CuEvent()
+        stop = CUDA.CuEvent()
+        CUDA.cuEventRecord(start, CUDA.stream())
+        f()
+        CUDA.cuEventRecord(stop, CUDA.stream())
+        CUDA.cuEventSynchronize(stop)
+        ms = Ref{Float32}(0.0)
+        CUDA.cuEventElapsedTime(ms, start, stop)
+        return ms[] / 1000.0
+    else
+        f()
+        return NaN
+    end
+end
+
+function query_nvidia_smi_metrics()
+    try
+        out = readchomp(`nvidia-smi --query-gpu=utilization.gpu,memory.used,memory.total --format=csv,noheader,nounits`)
+        first_line = split(out, '\n')[1]
+        vals = strip.(split(first_line, ','))
+        if length(vals) >= 3
+            return (parse(Float64, vals[1]), parse(Float64, vals[2]), parse(Float64, vals[3]))
+        end
+    catch
+    end
+
+    return (NaN, NaN, NaN)
+end
 
 const g = 1.0
 
@@ -1238,6 +1268,8 @@ end
             outdir="frames",
             do_viz=false,
             benchmark=false,
+            test=false,
+            test_file="",
             topology=(2, 2),
             warmup=50,
             benchdir = "docs/benchmarks/sim_benchmarks.csv")
@@ -1305,7 +1337,7 @@ end
     ix_roi = 2:(nx_global - 1)
     iy_roi = 2:(ny_global - 1)
 
-    if !benchmark
+    if !benchmark && !test
         save_domain_decomposition!(outdir;
             me = me,
             dims = dims,
@@ -1323,7 +1355,7 @@ end
             comm_cart = comm_cart,
             ix_roi = ix_roi,
             iy_roi = iy_roi,
-            filename = "domain_decomposition.jls"
+            filename = "domain_decomposition_$(dims_mpi[1])x$(dims_mpi[2]).jls"
         )
         return nothing
     end
@@ -1369,6 +1401,31 @@ end
     z  = Data.Array(z_local)
     η0 = Data.Array(η0_local)
     hmin  = 1e-2
+    h .= max.(0.0, η0 .- z)
+
+    function save_test_h!(outdir, test_file="")
+        fname = isempty(test_file) ? joinpath(outdir, "test_h.jls") : test_file
+        mkpath(dirname(fname))
+        h_inn = Array{Float32}(undef, nx - 2, ny - 2)
+        h_inn .= Array(h)[2:end-1, 2:end-1]
+        h_v = zeros(Float32, nx_global - 2, ny_global - 2)
+        gather_global_array_manual!(h_inn, h_v, comm_cart)
+
+        if me == 0
+            open(fname, "w") do io
+                serialize(io, h_v)
+            end
+            @info "Saved test h array to $fname"
+        end
+    end
+
+    if test
+        save_test_h!(outdir, test_file)
+        if owns_mpi
+            MPI.Finalize()
+        end
+        return nothing
+    end
 
     dt_drain = @zeros(nx, ny)
     halo_buffers = allocate_halo_buffers(h)
@@ -1432,9 +1489,16 @@ end
         MPI.Barrier(comm_cart)
     end
 
-    # vector for walltimes 
+    # vector for walltimes and GPU metrics
     num_repeats = benchmark ? runs : 1
     walltimes = Float64[]
+    gpu_time_s = Float64[]
+    gpu_start_util = Float64[]
+    gpu_start_mem = Float64[]
+    gpu_start_mem_total = Float64[]
+    gpu_end_util = Float64[]
+    gpu_end_mem = Float64[]
+    gpu_end_mem_total = Float64[]
 
     # loop for N runs
     for r in 1:num_repeats
@@ -1446,36 +1510,47 @@ end
         MPI.Barrier(comm_cart)
         loop_t0 = time_ns()
 
-        for it in 1:nt
-            @parallel compute_maxspeed!(max_speed_x, max_speed_y, h, hu, hv, z, g, vel_eps)
+        local_gpu_start_util, local_gpu_start_mem, local_gpu_start_mem_total = query_nvidia_smi_metrics()
+        local_gpu_time_s = gpu_event_time() do
+            for it in 1:nt
+                @parallel compute_maxspeed!(max_speed_x, max_speed_y, h, hu, hv, z, g, vel_eps)
 
-            if it % 10 == 0 || it == 1
-                dt = 0.9 / (max_g(max_speed_x, comm_cart) * _dx + max_g(max_speed_y, comm_cart) * _dy)
+                if it % 10 == 0 || it == 1
+                    dt = 0.9 / (max_g(max_speed_x, comm_cart) * _dx + max_g(max_speed_y, comm_cart) * _dy)
+                end
+
+                time += dt
+
+                @parallel compute_1st_2nd_and_3th_flux!(F₁, F₂, F₃, G₁, G₂, G₃, hu, hv, h, z, g, max_speed_x, max_speed_y, vel_eps)
+                @parallel compute_draining_timestep!(dt_drain, F₁, G₁, h, dt, _dx, _dy)
+                update_halo_dt_drain!(dt_drain, halo_buffers, comm_cart, neighbors_x, neighbors_y)
+                @parallel compute_effective_flux_timesteps!(dtFx, dtGy, dt_drain, F₁, G₁, dt)
+                @parallel update_height_momentum!(h, hu, hv, F₁, G₁, F₂, F₃, G₂, G₃, dtFx, dtGy, z, g, dt, _dx, _dy)
+                update_halo!(h, hu, hv, halo_buffers, comm_cart, neighbors_x, neighbors_y)
+                @parallel dry_cell_fix!(h, hu, hv, hmin)
+
+                if is_left;   @parallel (1:ny) left_bc!(h, hu, hv, g, dt, _dx);   end
+                if is_right;  @parallel (1:ny) right_bc!(h, hu, hv, g, dt, _dx);  end
+                if is_bottom; @parallel (1:nx) bottom_bc!(h, hu, hv, g, dt, _dy); end
+                if is_top;    @parallel (1:nx) top_bc!(h, hu, hv, g, dt, _dy);    end
+
+                @parallel dry_cell_fix!(h, hu, hv, hmin)
             end
-
-            time += dt
-
-            @parallel compute_1st_2nd_and_3th_flux!(F₁, F₂, F₃, G₁, G₂, G₃, hu, hv, h, z, g, max_speed_x, max_speed_y, vel_eps)
-            @parallel compute_draining_timestep!(dt_drain, F₁, G₁, h, dt, _dx, _dy)
-            update_halo_dt_drain!(dt_drain, halo_buffers, comm_cart, neighbors_x, neighbors_y)
-            @parallel compute_effective_flux_timesteps!(dtFx, dtGy, dt_drain, F₁, G₁, dt)
-            @parallel update_height_momentum!(h, hu, hv, F₁, G₁, F₂, F₃, G₂, G₃, dtFx, dtGy, z, g, dt, _dx, _dy)
-            update_halo!(h, hu, hv, halo_buffers, comm_cart, neighbors_x, neighbors_y)
-            @parallel dry_cell_fix!(h, hu, hv, hmin)
-
-            if is_left;   @parallel (1:ny) left_bc!(h, hu, hv, g, dt, _dx);   end
-            if is_right;  @parallel (1:ny) right_bc!(h, hu, hv, g, dt, _dx);  end
-            if is_bottom; @parallel (1:nx) bottom_bc!(h, hu, hv, g, dt, _dy); end
-            if is_top;    @parallel (1:nx) top_bc!(h, hu, hv, g, dt, _dy);    end
-
-            @parallel dry_cell_fix!(h, hu, hv, hmin)
         end
+        local_gpu_end_util, local_gpu_end_mem, local_gpu_end_mem_total = query_nvidia_smi_metrics()
 
         @synchronize()
         MPI.Barrier(comm_cart)
         run_walltime = MPI.Allreduce((time_ns() - loop_t0) * 1e-9, MPI.MAX, comm_cart)
         push!(walltimes, run_walltime)
-        
+        push!(gpu_time_s, local_gpu_time_s)
+        push!(gpu_start_util, local_gpu_start_util)
+        push!(gpu_start_mem, local_gpu_start_mem)
+        push!(gpu_start_mem_total, local_gpu_start_mem_total)
+        push!(gpu_end_util, local_gpu_end_util)
+        push!(gpu_end_mem, local_gpu_end_mem)
+        push!(gpu_end_mem_total, local_gpu_end_mem_total)
+
         if me == 0 && benchmark
             @printf("Run %2d/%2d completed in %.6f seconds\n", r, num_repeats, run_walltime)
         end
@@ -1488,7 +1563,7 @@ end
 
         open(benchdir, "a") do io
             if !file_exists
-                println(io, "solver,nprocs,topology,nx_global,ny_global,nx_local,ny_local,nt,run,walltime,steps_per_second,cell_updates_per_second")
+                println(io, "solver,nprocs,topology,nx_global,ny_global,nx_local,ny_local,nt,run,walltime,steps_per_second,cell_updates_per_second,gpu_time_s,gpu_start_util,gpu_start_mem,gpu_start_mem_total,gpu_end_util,gpu_end_mem,gpu_end_mem_total")
             end
 
             cells_per_step = nx_global * ny_global
@@ -1497,10 +1572,12 @@ end
 
             for (r, wtime) in enumerate(walltimes)
                 cup_sec = cells_per_step * nt / wtime
-                @printf(io, "%s,%d,%s,%d,%d,%d,%d,%d,%d,%.9f,%.6f,%.6e\n",
+                @printf(io, "%s,%d,%s,%d,%d,%d,%d,%d,%d,%.9f,%.6f,%.6e,%.9f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f\n",
                     solver_type, nprocs, topology_str,
                     nx_global, ny_global, nx, ny, nt, r,
-                    wtime, nt / wtime, cup_sec
+                    wtime, nt / wtime, cup_sec,
+                    gpu_time_s[r], gpu_start_util[r], gpu_start_mem[r], gpu_start_mem_total[r],
+                    gpu_end_util[r], gpu_end_mem[r], gpu_end_mem_total[r]
                 )
             end
         end
@@ -1521,8 +1598,10 @@ function main()
     input_runs = 10     # Default: 10 Durchläufe
     input_outdir = "docs/frames/manual"
     input_benchdir = "docs/benchmark/walltime_4_ranks.csv"
-    input_do_viz = false
-    input_benchmark = true
+    input_do_viz = true
+    input_benchmark = false
+    input_test = false
+    input_test_file = ""
     input_warmup = 5
     top_x = 2
     top_y = 2
@@ -1546,10 +1625,15 @@ function main()
             input_outdir = ARGS[i+1]
         elseif ARGS[i] == "--benchmark"
             input_benchmark = true
+        elseif ARGS[i] == "--test"
+            input_test = true
+        elseif ARGS[i] == "--test-file"
+            input_test_file = ARGS[i+1]
         elseif ARGS[i] == "--benchdir"
             input_benchdir = ARGS[i+1]
         elseif ARGS[i] == "--warmup"
             input_warmup = parse(Int, ARGS[i+1]); i += 1
+
         end
     end
 
@@ -1557,8 +1641,10 @@ function main()
         nt=input_nt,
         runs=input_runs,
         outdir = input_outdir,
-        do_viz = input_do_viz && !input_benchmark,
+        do_viz = input_do_viz && !input_benchmark && !input_test,
         benchmark = input_benchmark,
+        test = input_test,
+        test_file = input_test_file,
         topology = (top_x, top_y),
         warmup = input_warmup,
         benchdir = input_benchdir

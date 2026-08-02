@@ -4,7 +4,7 @@ using ImplicitGlobalGrid
 import MPI
 
 const CLI_BENCHMARK_MODE = "--benchmark" in ARGS
-const USE_GPU = false
+const USE_GPU = true
 using ParallelStencil
 using ParallelStencil.FiniteDifferences2D
 import ParallelStencil: @reset_parallel_stencil
@@ -960,7 +960,10 @@ Run the simple 2D SWE baseline with IGG domain decomposition.
             outdir="frames",
             do_viz=false,
             benchmark=false,
-            benchdir = "benchmark")
+            test=false,
+            test_file="",
+            warmup=5,
+            benchdir="docs/benchmark/baseline.csv")
     lx = 50.0
     ly = 50.0
 
@@ -1002,12 +1005,12 @@ Run the simple 2D SWE baseline with IGG domain decomposition.
     
     b_width     = (8, 8, 0)
 
-    if me == 0 && !benchmark
-        println("Global domain size (including halos): ", nx_global, " x ", ny_global)
-        println("MPI topology: ", dims[1], " x ", dims[2])
-        println("Local domain size (including halos): ", nx, " x ", ny)
-        println("Time steps: ", nt)
-    end
+
+    println("Global domain size (including halos): ", nx_global, " x ", ny_global)
+    println("MPI topology: ", dims[1], " x ", dims[2])
+    println("Local domain size (including halos): ", nx, " x ", ny)
+    println("Time steps: ", nt)
+
 
     nvis = 5
     # DIFF baseline/manual: nx_g()/ny_g() and x_g()/y_g() are IGG global-grid
@@ -1026,7 +1029,43 @@ Run the simple 2D SWE baseline with IGG domain decomposition.
     ix_roi = 2:(nx_g() - 1)
     iy_roi = 2:(ny_g() - 1)
 
-    if !benchmark
+    function reset_fields!()
+        h .= max.(0.0, η0 .- z)
+        hu .= 0.0
+        hv .= 0.0
+        dt_drain .= 0.0
+        dtFx .= 0.0
+        dtGy .= 0.0
+
+        @parallel dry_cell_fix!(h, hu, hv, hmin)
+        update_halo!(h, hu, hv)
+
+        if is_left;   @parallel (1:ny) left_bc!(h, hu, hv, g, 0.0, _dx);   end
+        if is_right;  @parallel (1:ny) right_bc!(h, hu, hv, g, 0.0, _dx);  end
+        if is_bottom; @parallel (1:nx) bottom_bc!(h, hu, hv, g, 0.0, _dy); end
+        if is_top;    @parallel (1:nx) top_bc!(h, hu, hv, g, 0.0, _dy);    end
+        @synchronize()
+    end
+
+    function save_test_h!(outdir, test_file="")
+        fname = isempty(test_file) ? joinpath(outdir, "test_h.jls") : test_file
+        mkpath(dirname(fname))
+        nx_v = nx - 2
+        ny_v = ny - 2
+        h_inn = Array{Float32}(undef, nx_v, ny_v)
+        h_inn .= Array(h)[2:end-1, 2:end-1]
+        h_v = zeros(Float32, nx_g() - 2, ny_g() - 2)
+        gather!(h_inn, h_v)
+
+        if me == 0
+            open(fname, "w") do io
+                serialize(io, h_v)
+            end
+            @info "Saved test h array to $fname"
+        end
+    end
+
+    if !benchmark && !test
         save_domain_decomposition!(outdir;
             me = me,
             dims = dims,
@@ -1087,6 +1126,12 @@ Run the simple 2D SWE baseline with IGG domain decomposition.
     hmin  = 1e-2
     h .= max.(0.0, η0 .- z)
 
+    if test
+        save_test_h!(outdir, test_file)
+        finalize_global_grid(finalize_MPI=!mpi_was_initialized)
+        return 0.0
+    end
+
     dt_drain = @zeros(nx, ny)
 
     dtFx = @zeros(nx - 1, ny)
@@ -1136,6 +1181,37 @@ Run the simple 2D SWE baseline with IGG domain decomposition.
 
     dt = 0.0
     loop_walltime = 0.0
+
+    if benchmark && warmup > 0
+        reset_fields!()
+        dt = 0.0
+        for it in 1:warmup
+            @parallel compute_maxspeed!(max_speed_x, max_speed_y, h, hu, hv, z, g, vel_eps)
+            if it == 1 || it % 10 == 0
+                dt = 0.9 / (max_g(max_speed_x) * _dx + max_g(max_speed_y) * _dy)
+            end
+            @parallel compute_1st_2nd_and_3th_flux!(F₁, F₂, F₃, G₁, G₂, G₃, hu, hv, h, z, g, max_speed_x, max_speed_y, vel_eps)
+            @hide_communication b_width begin
+                @parallel compute_draining_timestep!(dt_drain, F₁, G₁, h, dt, _dx, _dy)
+                update_halo!(dt_drain)
+            end
+            @parallel compute_effective_flux_timesteps!(dtFx, dtGy, dt_drain, F₁, G₁, dt)
+            @hide_communication b_width begin
+                @parallel update_height_momentum!(h, hu, hv, F₁, G₁, F₂, F₃, G₂, G₃, dtFx, dtGy, z, g, dt, _dx, _dy)
+                update_halo!(h, hu, hv)
+            end
+            @parallel dry_cell_fix!(h, hu, hv, hmin)
+            if is_left;   @parallel (1:ny) left_bc!(h, hu, hv, g, dt, _dx);   end
+            if is_right;  @parallel (1:ny) right_bc!(h, hu, hv, g, dt, _dx);  end
+            if is_bottom; @parallel (1:nx) bottom_bc!(h, hu, hv, g, dt, _dy); end
+            if is_top;    @parallel (1:nx) top_bc!(h, hu, hv, g, dt, _dy);    end
+        end
+        @synchronize()
+        MPI.Barrier(comm_cart)
+        reset_fields!()
+        @synchronize()
+        MPI.Barrier(comm_cart)
+    end
 
     @synchronize()
     MPI.Barrier(comm_cart)
@@ -1240,37 +1316,30 @@ Run the simple 2D SWE baseline with IGG domain decomposition.
         if me == 0
             cells_per_step = nx_g() * ny_g()
             cell_updates_per_second = cells_per_step * nt / loop_walltime
-            
-            # path of simulation benchmarks
-            log_filename = joinpath(benchdir, "simulation_benchmarks.csv")
-            # check if file exists
-            file_exists = isfile(log_filename)
-            
-            open(log_filename, "a") do io
+            println(
+                "BENCHMARK ",
+                "walltime_seconds=", @sprintf("%.9f", loop_walltime), " ",
+                "nt=", nt, " ",
+                "global_size=", nx_g(), "x", ny_g(), " ",
+                "local_size=", nx, "x", ny, " ",
+                "nprocs=", nprocs, " ",
+                "steps_per_second=", @sprintf("%.6f", nt / loop_walltime), " ",
+                "cell_updates_per_second=", @sprintf("%.6e", cell_updates_per_second)
+            )
+
+            mkpath(dirname(benchdir))
+            file_exists = isfile(benchdir)
+            open(benchdir, "a") do io
                 if !file_exists
-                    # write header if file does not exist
-                    println(io, "solver,nprocs,topology,nx_global,ny_global,nx_local,ny_local,nt,walltime,steps_per_second,cell_updates_per_second")
+                    println(io, "solver,nprocs,topology,nx_global,ny_global,nx_local,ny_local,nt,run,walltime,steps_per_second,cell_updates_per_second")
                 end
-                
-                solver_type = "igg_baseline" 
-                topology_str = "$(dims_mpi[1])x$(dims_mpi[2])"
-                
-                # write to file 
-                @printf(io, "%s,%d,%s,%d,%d,%d,%d,%d,%.9f,%.6f,%.6e\n",
-                    solver_type,
-                    nprocs,
-                    topology_str,
-                    nx_g(),
-                    ny_g(),
-                    nx, # nx_local inkl. Halos
-                    ny, # ny_local inkl. Halos
-                    nt,
-                    loop_walltime,
-                    nt / loop_walltime,
-                    cell_updates_per_second
+                topology_str = "$(dims[1])x$(dims[2])"
+                @printf(io, "%s,%d,%s,%d,%d,%d,%d,%d,%d,%.9f,%.6f,%.6e\n",
+                    "baseline", nprocs, topology_str,
+                    nx_g(), ny_g(), nx, ny, nt, 1,
+                    loop_walltime, nt / loop_walltime, cell_updates_per_second
                 )
             end
-            println("Benchmark-metrics saved to: $log_filename")
         end
         # DIFF baseline/manual: IGG owns grid teardown here. manual.jl finalizes
         # MPI only if it initialized MPI itself.
@@ -1296,11 +1365,14 @@ end
 
 input_nx = 802
 input_ny = 802
-input_nt = 200
+input_nt = 2000
 input_outdir = "docs/frames/baseline"
-input_benchdir = "docs/benchmark"
 input_do_viz = false
 input_benchmark = false
+input_test = false
+input_test_file = ""
+input_benchdir = "docs/benchmark/baseline.csv"
+input_warmup = 5
 
 for i in 1:length(ARGS)
     if ARGS[i] == "--nx"
@@ -1311,12 +1383,18 @@ for i in 1:length(ARGS)
         global input_nt = parse(Int, ARGS[i+1])
     elseif ARGS[i] == "--outdir"
         global input_outdir = ARGS[i+1]
-    elseif ARGS[i] == "--benchdir"
-        global input_benchdir = ARGS[i+1]
     elseif ARGS[i] == "--viz"
         global input_do_viz = true
     elseif ARGS[i] == "--benchmark"
         global input_benchmark = true
+    elseif ARGS[i] == "--test"
+        global input_test = true
+    elseif ARGS[i] == "--test-file"
+        global input_test_file = ARGS[i+1]
+    elseif ARGS[i] == "--benchdir"
+        global input_benchdir = ARGS[i+1]
+    elseif ARGS[i] == "--warmup"
+        global input_warmup = parse(Int, ARGS[i+1])
     end
 end
 
@@ -1324,4 +1402,8 @@ run_baseline(input_nx, input_ny; nt=input_nt,
     outdir = input_outdir,
     do_viz = input_do_viz && !input_benchmark,
     benchmark = input_benchmark,
-    benchdir =  input_benchdir)
+    test = input_test,
+    test_file = input_test_file,
+    warmup = input_warmup,
+    benchdir = input_benchdir
+)
