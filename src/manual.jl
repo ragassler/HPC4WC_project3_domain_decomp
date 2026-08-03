@@ -1337,7 +1337,7 @@ end
     ix_roi = 2:(nx_global - 1)
     iy_roi = 2:(ny_global - 1)
 
-    if !benchmark && !test
+    if !benchmark && !test && !do_viz
         save_domain_decomposition!(outdir;
             me = me,
             dims = dims,
@@ -1530,12 +1530,18 @@ end
     gpu_end_util = Float64[]
     gpu_end_mem = Float64[]
     gpu_end_mem_total = Float64[]
+    nvis = benchmark ? 0 : 50  # visualization frequency
 
     # loop for N runs
     for r in 1:num_repeats
         reset_fields!()
         time = 0.0
         dt = 0.0
+
+        if me == 0 
+            #print flags: benchmark do_viz , run number nvis
+            print("Run $r/$num_repeats: benchmark=$benchmark, do_viz=$do_viz, nvis=$nvis\n")
+        end
 
         @synchronize()
         MPI.Barrier(comm_cart)
@@ -1566,6 +1572,7 @@ end
                 if is_top;    @parallel (1:nx) top_bc!(h, hu, hv, g, dt, _dy);    end
 
                 @parallel dry_cell_fix!(h, hu, hv, hmin)
+            
 
                 if do_viz && !benchmark && it % nvis == 0 && r == 1
 
