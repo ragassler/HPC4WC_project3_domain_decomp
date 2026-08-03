@@ -1489,6 +1489,37 @@ end
         MPI.Barrier(comm_cart)
     end
 
+    if do_viz && !benchmark
+        if me == 0
+            println("Using visualization: Array output")
+        end
+        mkpath(outdir)
+        
+        nx_v, ny_v = (nx - 2) * dims[1], (ny - 2) * dims[2]
+        h_v = zeros(nx_v, ny_v)
+        z_v = zeros(nx_v, ny_v)
+        h_inn = zeros(nx - 2, ny - 2)
+        z_inn = zeros(nx - 2, ny - 2)
+        h_inn .= Array(h)[2:end-1, 2:end-1]; gather_global_array_manual!(h_inn, h_v, comm_cart)
+        z_inn .= Array(z)[2:end-1, 2:end-1]; gather_global_array_manual!(z_inn, z_v, comm_cart)
+
+        if me == 0
+            frame_id = Ref(0)
+            @info "Saving arrays to $outdir"
+            function save_array!()
+                frame_id[] += 1
+                fname = joinpath(outdir, @sprintf("array_frame_%06d.jls", frame_id[]))
+                serialize(fname, (h=Array(convert.(Float32, h_v)),))
+            end
+            function save_array_with_z!()
+                frame_id[] += 1
+                fname = joinpath(outdir, @sprintf("array_frame_%06d.jls", frame_id[]))
+                serialize(fname, (h=Array(convert.(Float32, h_v)), z=Array(convert.(Float32, z_v))))
+            end
+            save_array_with_z!()
+        end
+    end
+
     # vector for walltimes and GPU metrics
     num_repeats = benchmark ? runs : 1
     walltimes = Float64[]
@@ -1535,6 +1566,18 @@ end
                 if is_top;    @parallel (1:nx) top_bc!(h, hu, hv, g, dt, _dy);    end
 
                 @parallel dry_cell_fix!(h, hu, hv, hmin)
+
+                if do_viz && !benchmark && it % nvis == 0 && r == 1
+
+                    # DIFF manual/baseline: output gather uses manual MPI.Gatherv!.
+                    # baseline.jl calls IGG gather! here.
+                    h_inn .= Array(h)[2:end-1, 2:end-1]; gather_global_array_manual!(h_inn, h_v, comm_cart)
+                    z_inn .= Array(z)[2:end-1, 2:end-1]; gather_global_array_manual!(z_inn, z_v, comm_cart)
+
+                    if me == 0
+                        save_array!()
+                    end
+                end
             end
         end
         local_gpu_end_util, local_gpu_end_mem, local_gpu_end_mem_total = query_nvidia_smi_metrics()
