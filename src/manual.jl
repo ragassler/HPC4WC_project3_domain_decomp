@@ -357,37 +357,6 @@ end
     return nothing
 end
 
-@inline function gpu_event_time(f)
-    if USE_GPU
-        start = CUDA.CuEvent()
-        stop = CUDA.CuEvent()
-        CUDA.cuEventRecord(start, CUDA.stream())
-        f()
-        CUDA.cuEventRecord(stop, CUDA.stream())
-        CUDA.cuEventSynchronize(stop)
-        ms = Ref{Float32}(0.0)
-        CUDA.cuEventElapsedTime(ms, start, stop)
-        return ms[] / 1000.0
-    else
-        f()
-        return NaN
-    end
-end
-
-function query_nvidia_smi_metrics()
-    try
-        out = readchomp(`nvidia-smi --query-gpu=utilization.gpu,memory.used,memory.total --format=csv,noheader,nounits`)
-        first_line = split(out, '\n')[1]
-        vals = strip.(split(first_line, ','))
-        if length(vals) >= 3
-            return (parse(Float64, vals[1]), parse(Float64, vals[2]), parse(Float64, vals[3]))
-        end
-    catch
-    end
-
-    return (NaN, NaN, NaN)
-end
-
 const g = 1.0
 
 """
@@ -1520,16 +1489,9 @@ end
         end
     end
 
-    # vector for walltimes and GPU metrics
+    # Vector for benchmark wall times.
     num_repeats = benchmark ? runs : 1
     walltimes = Float64[]
-    gpu_time_s = Float64[]
-    gpu_start_util = Float64[]
-    gpu_start_mem = Float64[]
-    gpu_start_mem_total = Float64[]
-    gpu_end_util = Float64[]
-    gpu_end_mem = Float64[]
-    gpu_end_mem_total = Float64[]
     nvis = benchmark ? 0 : 50  # visualization frequency
 
     # loop for N runs
@@ -1547,59 +1509,47 @@ end
         MPI.Barrier(comm_cart)
         loop_t0 = time_ns()
 
-        local_gpu_start_util, local_gpu_start_mem, local_gpu_start_mem_total = query_nvidia_smi_metrics()
-        local_gpu_time_s = gpu_event_time() do
-            for it in 1:nt
-                @parallel compute_maxspeed!(max_speed_x, max_speed_y, h, hu, hv, z, g, vel_eps)
+        for it in 1:nt
+            @parallel compute_maxspeed!(max_speed_x, max_speed_y, h, hu, hv, z, g, vel_eps)
 
-                if it % 10 == 0 || it == 1
-                    dt = 0.9 / (max_g(max_speed_x, comm_cart) * _dx + max_g(max_speed_y, comm_cart) * _dy)
-                end
+            if it % 10 == 0 || it == 1
+                dt = 0.9 / (max_g(max_speed_x, comm_cart) * _dx + max_g(max_speed_y, comm_cart) * _dy)
+            end
 
-                time += dt
+            time += dt
 
-                @parallel compute_1st_2nd_and_3th_flux!(F₁, F₂, F₃, G₁, G₂, G₃, hu, hv, h, z, g, max_speed_x, max_speed_y, vel_eps)
-                @parallel compute_draining_timestep!(dt_drain, F₁, G₁, h, dt, _dx, _dy)
-                update_halo_dt_drain!(dt_drain, halo_buffers, comm_cart, neighbors_x, neighbors_y)
-                @parallel compute_effective_flux_timesteps!(dtFx, dtGy, dt_drain, F₁, G₁, dt)
-                @parallel update_height_momentum!(h, hu, hv, F₁, G₁, F₂, F₃, G₂, G₃, dtFx, dtGy, z, g, dt, _dx, _dy)
-                update_halo!(h, hu, hv, halo_buffers, comm_cart, neighbors_x, neighbors_y)
-                @parallel dry_cell_fix!(h, hu, hv, hmin)
+            @parallel compute_1st_2nd_and_3th_flux!(F₁, F₂, F₃, G₁, G₂, G₃, hu, hv, h, z, g, max_speed_x, max_speed_y, vel_eps)
+            @parallel compute_draining_timestep!(dt_drain, F₁, G₁, h, dt, _dx, _dy)
+            update_halo_dt_drain!(dt_drain, halo_buffers, comm_cart, neighbors_x, neighbors_y)
+            @parallel compute_effective_flux_timesteps!(dtFx, dtGy, dt_drain, F₁, G₁, dt)
+            @parallel update_height_momentum!(h, hu, hv, F₁, G₁, F₂, F₃, G₂, G₃, dtFx, dtGy, z, g, dt, _dx, _dy)
+            update_halo!(h, hu, hv, halo_buffers, comm_cart, neighbors_x, neighbors_y)
+            @parallel dry_cell_fix!(h, hu, hv, hmin)
 
-                if is_left;   @parallel (1:ny) left_bc!(h, hu, hv, g, dt, _dx);   end
-                if is_right;  @parallel (1:ny) right_bc!(h, hu, hv, g, dt, _dx);  end
-                if is_bottom; @parallel (1:nx) bottom_bc!(h, hu, hv, g, dt, _dy); end
-                if is_top;    @parallel (1:nx) top_bc!(h, hu, hv, g, dt, _dy);    end
+            if is_left;   @parallel (1:ny) left_bc!(h, hu, hv, g, dt, _dx);   end
+            if is_right;  @parallel (1:ny) right_bc!(h, hu, hv, g, dt, _dx);  end
+            if is_bottom; @parallel (1:nx) bottom_bc!(h, hu, hv, g, dt, _dy); end
+            if is_top;    @parallel (1:nx) top_bc!(h, hu, hv, g, dt, _dy);    end
 
-                @parallel dry_cell_fix!(h, hu, hv, hmin)
-            
+            @parallel dry_cell_fix!(h, hu, hv, hmin)
 
-                if do_viz && !benchmark && it % nvis == 0 && r == 1
+            if do_viz && !benchmark && it % nvis == 0 && r == 1
 
-                    # DIFF manual/baseline: output gather uses manual MPI.Gatherv!.
-                    # baseline.jl calls IGG gather! here.
-                    h_inn .= Array(h)[2:end-1, 2:end-1]; gather_global_array_manual!(h_inn, h_v, comm_cart)
-                    z_inn .= Array(z)[2:end-1, 2:end-1]; gather_global_array_manual!(z_inn, z_v, comm_cart)
+                # DIFF manual/baseline: output gather uses manual MPI.Gatherv!.
+                # baseline.jl calls IGG gather! here.
+                h_inn .= Array(h)[2:end-1, 2:end-1]; gather_global_array_manual!(h_inn, h_v, comm_cart)
+                z_inn .= Array(z)[2:end-1, 2:end-1]; gather_global_array_manual!(z_inn, z_v, comm_cart)
 
-                    if me == 0
-                        save_array!()
-                    end
+                if me == 0
+                    save_array!()
                 end
             end
         end
-        local_gpu_end_util, local_gpu_end_mem, local_gpu_end_mem_total = query_nvidia_smi_metrics()
 
         @synchronize()
         MPI.Barrier(comm_cart)
         run_walltime = MPI.Allreduce((time_ns() - loop_t0) * 1e-9, MPI.MAX, comm_cart)
         push!(walltimes, run_walltime)
-        push!(gpu_time_s, local_gpu_time_s)
-        push!(gpu_start_util, local_gpu_start_util)
-        push!(gpu_start_mem, local_gpu_start_mem)
-        push!(gpu_start_mem_total, local_gpu_start_mem_total)
-        push!(gpu_end_util, local_gpu_end_util)
-        push!(gpu_end_mem, local_gpu_end_mem)
-        push!(gpu_end_mem_total, local_gpu_end_mem_total)
 
         if me == 0 && benchmark
             @printf("Run %2d/%2d completed in %.6f seconds\n", r, num_repeats, run_walltime)
@@ -1610,10 +1560,19 @@ end
     if benchmark && me == 0
         mkpath(dirname(benchdir))
         file_exists = isfile(benchdir)
+        benchmark_header = "solver,nprocs,topology,nx_global,ny_global,nx_local,ny_local,nt,run,walltime,steps_per_second,cell_updates_per_second"
+
+        if file_exists
+            existing_header = open(readline, benchdir)
+            existing_header == benchmark_header || error(
+                "Existing benchmark CSV has an incompatible header: $benchdir. " *
+                "Use a new --benchdir path or move the old profiling CSV first."
+            )
+        end
 
         open(benchdir, "a") do io
             if !file_exists
-                println(io, "solver,nprocs,topology,nx_global,ny_global,nx_local,ny_local,nt,run,walltime,steps_per_second,cell_updates_per_second,gpu_time_s,gpu_start_util,gpu_start_mem,gpu_start_mem_total,gpu_end_util,gpu_end_mem,gpu_end_mem_total")
+                println(io, benchmark_header)
             end
 
             cells_per_step = nx_global * ny_global
@@ -1622,12 +1581,10 @@ end
 
             for (r, wtime) in enumerate(walltimes)
                 cup_sec = cells_per_step * nt / wtime
-                @printf(io, "%s,%d,%s,%d,%d,%d,%d,%d,%d,%.9f,%.6f,%.6e,%.9f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f\n",
+                @printf(io, "%s,%d,%s,%d,%d,%d,%d,%d,%d,%.9f,%.6f,%.6e\n",
                     solver_type, nprocs, topology_str,
                     nx_global, ny_global, nx, ny, nt, r,
-                    wtime, nt / wtime, cup_sec,
-                    gpu_time_s[r], gpu_start_util[r], gpu_start_mem[r], gpu_start_mem_total[r],
-                    gpu_end_util[r], gpu_end_mem[r], gpu_end_mem_total[r]
+                    wtime, nt / wtime, cup_sec
                 )
             end
         end
