@@ -30,7 +30,7 @@ for topo in topologies
     println("==================================================")
     
     # Exakt dein funktionierender Befehl mit dynamischen Variablen
-    run(`$(MPI.mpiexec()) -n $procs julia --project src/manual_time_halo.jl --topology $topo --nx $nx --ny $ny --nt $nt --benchmark`)
+    run(`$(MPI.mpiexec()) -n $procs julia --project src/manual_halo_timing.jl --topology $topo --nx $nx --ny $ny --nt $nt --benchmark`)
     
     println("Topologie ", topo, " abgeschlossen.\n")
 end

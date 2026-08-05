@@ -36,7 +36,7 @@ for (iframe, file) in enumerate(files)
     z = last_z === nothing ? zeros(size(h)) : last_z
     eta = h .+ z
 
-    fig = Figure(size = (900, 760))
+    fig = Figure(size = (600, 200))
     ax = Axis(fig[1, 1];
         title = "free surface, frame $iframe",
         xlabel = "x index",
@@ -45,8 +45,9 @@ for (iframe, file) in enumerate(files)
     )
 
     hm = heatmap!(ax, eta; colormap = :viridis)
-    Colorbar(fig[1, 2], hm, label = "eta = h + z")
-
+    Colorbar(fig[1, 2], hm,
+        label = "eta = h + z")
+    
     out = joinpath(output_dir, @sprintf("frame_%06d.png", iframe))
     save(out, fig)
     println("saved ", out)

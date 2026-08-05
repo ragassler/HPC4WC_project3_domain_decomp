@@ -14,7 +14,7 @@ export MPICH_GPU_SUPPORT_ENABLED=1
 export IGG_CUDAAWARE_MPI=1 # IGG
 export JULIA_CUDA_USE_COMPAT=false # IGG
 
-# Die Topologien im gewünschten Format definieren
+# Define topologies in the format expected by manual.jl
 topologies=(
     "(16,1)"
     "(8,2)"
@@ -30,9 +30,8 @@ for topo in "${topologies[@]}"; do
     echo "=========================================="
     
     topo_clean=$(echo "${topo}" | tr -d '(),')
-    csv_file="docs/benchmark/gpu_topo_16_ranks.csv"
+    csv_file="output/walltimes_16_ranks.csv"
 
-    # Nur NOCH EIN EINZIGER srun AUFRUF PRO TOPOLOGIE:
     srun --export=ALL,USE_GPU=true julia --project manual.jl \
         --topo "${topo}" \
         --nx 32770 \
@@ -41,6 +40,6 @@ for topo in "${topologies[@]}"; do
         --benchmark \
         --benchdir "${csv_file}"
 
-    echo "Topologie ${topo} finished."
+    echo "Topology ${topo} finished."
 done
 

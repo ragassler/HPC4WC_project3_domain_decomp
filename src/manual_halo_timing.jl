@@ -1240,7 +1240,7 @@ end
             outdir="frames",
             do_viz=false,
             benchmark=false,
-            benchdir = "docs/benchmark/halo_exchange_v1.csv",
+            benchdir = "docs/benchmark/halo_exchange.csv",
             topology=(2, 2),
             warmup=5)
 
@@ -1477,6 +1477,10 @@ end
             dt,
             _dx, _dy
         )
+        # -------------------------------------------- Timer (dt_drain halo)
+        @synchronize()
+        MPI.Barrier(comm_cart)
+        drain_t0 = time_ns()
         update_halo_dt_drain!(
             dt_drain,
             halo_buffers,
@@ -1484,6 +1488,9 @@ end
             neighbors_x,
             neighbors_y,
         )
+        @synchronize()
+        halo_wtime_drain = MPI.Allreduce((time_ns() - drain_t0) * 1e-9, MPI.MAX, comm_cart)
+        # -------------------------------------------- Timer (dt_drain halo)
 
 
         @parallel compute_effective_flux_timesteps!(
@@ -1501,7 +1508,7 @@ end
         )
 
         # ------------------------------------------------------------ Timer
-        # Time only the MPI halo exchange (update_halo!).
+        # Time both MPI halo exchanges: dt_drain (above) and update_halo! (here).
         @synchronize()
         MPI.Barrier(comm_cart)
         loop_t0 = time_ns()
@@ -1519,7 +1526,7 @@ end
         @synchronize()
 
         halo_wtime = MPI.Allreduce((time_ns() - loop_t0) * 1e-9, MPI.MAX, comm_cart)
-        push!(halo_walltimes, halo_wtime)
+        push!(halo_walltimes, halo_wtime + halo_wtime_drain)
         push!(iteration_numbers, it)
         # ------------------------------------------------------------ Timer
 
@@ -1582,7 +1589,7 @@ function main()
     input_ny = 402
     input_nt = 200
     input_outdir = "docs/frames/manual"
-    input_benchdir = "docs/benchmark/halo_exchange_v1.csv"
+    input_benchdir = "docs/benchmark/halo_exchange.csv"
     input_do_viz = false
     input_benchmark = true
     input_topology = (2, 2)

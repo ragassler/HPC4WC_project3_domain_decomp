@@ -2,7 +2,7 @@ using CairoMakie
 
 const PROJECT_ROOT = normpath(joinpath(@__DIR__, ".."))
 
-input_path = joinpath(PROJECT_ROOT, "output", "gpu_topo_16_ranks_v3.csv")
+input_path = joinpath(PROJECT_ROOT, "output", "walltimes_16_ranks.csv")
 output_path = nothing
 
 i = 1
@@ -27,10 +27,10 @@ function find_input_files(path)
     elseif isdir(path)
         files = filter(readdir(path; join=true)) do file
             name = lowercase(basename(file))
-            isfile(file) && startswith(name, "gpu_topo") && endswith(name, ".csv")
+            isfile(file) && endswith(name, ".csv") && startswith(name, "walltimes")
         end
         sort!(files)
-        isempty(files) && error("No gpu_topo*.csv files found in input directory: $path")
+        isempty(files) && error("No walltimes*.csv files found in input directory: $path")
         return files
     end
 
