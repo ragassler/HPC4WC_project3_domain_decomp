@@ -4,7 +4,8 @@ using ImplicitGlobalGrid
 import MPI
 
 const CLI_BENCHMARK_MODE = "--benchmark" in ARGS
-const USE_GPU = true
+const USE_GPU = lowercase(get(ENV, "USE_GPU", "true")) in ("1", "true", "yes")
+
 using ParallelStencil
 using ParallelStencil.FiniteDifferences2D
 import ParallelStencil: @reset_parallel_stencil
@@ -1012,7 +1013,7 @@ Run the simple 2D SWE baseline with IGG domain decomposition.
     println("Time steps: ", nt)
 
 
-    nvis = 5
+    nvis = benchmark ? 0 : 50  # visualization frequency
     # DIFF baseline/manual: nx_g()/ny_g() and x_g()/y_g() are IGG global-grid
     # helpers. manual.jl computes these values from nx_global/ny_global and a
     # local get_global_indices(...) helper.

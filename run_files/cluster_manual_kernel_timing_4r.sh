@@ -25,9 +25,9 @@ for topo in "${topologies[@]}"; do
     echo " Start srun with: --topology ${topo}"
     echo "=========================================="
 
-    csv_file="docs/benchmark/kernel_timing.csv"
+    csv_file="output/kernel_timing_4_ranks.csv"
 
-    srun --export=ALL,USE_GPU=true julia --project src/AI_manual_kernel_timing.jl \
+    srun --export=ALL,USE_GPU=true julia --project manual_kernel_timing.jl \
         --topology "${topo}" \
         --nx 16386 \
         --ny 4098 \

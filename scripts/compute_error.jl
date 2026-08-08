@@ -18,11 +18,13 @@ function load_h(path)
         return Array(obj.h)
     elseif isa(obj, Tuple) && length(obj) >= 1 && hasproperty(obj[1], :h)
         return Array(obj[1].h)
+    elseif obj isa AbstractArray
+        return Array(obj)
     else
         try
             return Array(obj.h)
         catch
-            error("Cannot extract h from $path")
+            error("Cannot extract h from $path (got $(typeof(obj)))")
         end
     end
 end

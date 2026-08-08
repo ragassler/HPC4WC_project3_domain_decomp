@@ -1335,7 +1335,7 @@ end
     xs = [x_g(ix, dx) - lx / 2 for ix in ix_g]
     ys = [y_g(iy, dy) - ly / 2 for iy in iy_g]
 
-    # Allokation der Arrays (einmalig für alle Runs!)
+    # Allocate the arrays (once for all runs!)
     h  = @zeros(nx, ny)
     hu = @zeros(nx, ny)
     hv = @zeros(nx, ny)
@@ -1411,7 +1411,7 @@ end
         max_speed_x .= 0.0; max_speed_y .= 0.0
         dt_drain .= 0.0; dtFx .= 0.0; dtGy .= 0.0
         
-        # 2. Halos und Ränder SOFORT synchronisieren (Wichtig!)
+        # 2. Synchronize halos and boundaries immediately (important!)
         update_halo!(h, hu, hv, halo_buffers, comm_cart, neighbors_x, neighbors_y)
         
         if is_left;   @parallel (1:ny) left_bc!(h, hu, hv, g, 0.0, _dx);   end
@@ -1421,7 +1421,7 @@ end
         
         @parallel dry_cell_fix!(h, hu, hv, hmin)
         
-        # 3. GPU/MPI Ausführung garantieren
+        # 3. Guarantee GPU/MPI execution
         @synchronize()
     end
 
@@ -1602,7 +1602,7 @@ function main()
     input_nx = 16386
     input_ny = 4098
     input_nt = 100
-    input_runs = 10     # Default: 10 Durchläufe
+    input_runs = 10     # Default: 10 runs
     input_outdir = "docs/frames/manual"
     input_benchdir = "docs/benchmark/walltime_4_ranks.csv"
     input_do_viz = true

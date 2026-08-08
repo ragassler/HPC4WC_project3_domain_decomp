@@ -1,8 +1,8 @@
 #!/bin/bash -l
 #SBATCH --account=hpc4wc-course2026-ethz
-#SBATCH --job-name="manual"
-#SBATCH --output=out/manual.%j.o
-#SBATCH --error=out/manual.%j.e
+#SBATCH --job-name="halo_timing"
+#SBATCH --output=out/halo_timing.%j.o
+#SBATCH --error=out/halo_timing.%j.e
 #SBATCH --time=00:20:00
 #SBATCH --nodes=1
 #SBATCH --ntasks=4
@@ -15,26 +15,23 @@ export IGG_CUDAAWARE_MPI=1
 export JULIA_CUDA_USE_COMPAT=false
 
 topologies=(
-    "(4,1)"
-    "(2,2)"
-    "(1,4)"
+    "4x1"
+    "2x2"
+    "1x4"
 )
 
 for topo in "${topologies[@]}"; do
     echo "=========================================="
-    echo " Start srun with: --topo ${topo}"
+    echo " Start srun with: --topology ${topo}"
     echo "=========================================="
-    
-    topo_clean=$(echo "${topo}" | tr -d '(),')
-    csv_file="docs/benchmark/gpu_topo_4_ranks.csv"
 
-    # Nur NOCH EIN EINZIGER srun AUFRUF PRO TOPOLOGIE:
-    srun --export=ALL,USE_GPU=true julia --project manual.jl \
-        --topo "${topo}" \
+    csv_file="output/halo_exchange_4_ranks.csv"
+
+    srun --export=ALL,USE_GPU=true julia --project manual_time_halo.jl \
+        --topology "${topo}" \
         --nx 16386 \
         --ny 4098 \
         --warmup 20 \
-        --runs 15 \
         --benchmark \
         --benchdir "${csv_file}"
 
