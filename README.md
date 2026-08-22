@@ -175,8 +175,9 @@ julia --project scripts/visualize_arrays.jl --input docs/frames/manual --output 
 ## Benchmark Data Provenance
 
 The CSV files under `output/` (`walltimes_*.csv`, `kernel_timing_*.csv`,
-`halo_exchange_*.csv`, `strong_scaling_*.csv`) were produced by the benchmark
-runs on CSCS Santis on the GPU backend (`USE_GPU=true`). They are GPU results,
+`halo_exchange_*.csv`, `strong_scaling_manual.csv`) were produced by the benchmark
+runs on CSCS Santis on the GPU backend (`USE_GPU=true`). The baseline strong-scaling
+results are in `output/benchmark/strong_scaling_baseline.csv`. All are GPU results,
 not local CPU runs. The local helper scripts (`run_files/local_*`) write their
 output under `docs/` (frames, validation, and benchmarks) if you want to compare
 with local CPU numbers.
@@ -209,18 +210,20 @@ given with `--output`).
 
 ## Timing Sources
 
-Beyond the combined benchmark in `src/manual.jl`, two dedicated timing variants
+Beyond the combined benchmark in `src/manual.jl`, three dedicated timing variants
 isolate the two components of the iteration time:
 
 - `src/manual_kernel_timing.jl`: times only the interior `ParallelStencil`
   kernels. Writes `kernel_walltime_seconds` per iteration to a CSV.
 - `src/manual_halo_timing.jl`: times only the blocking MPI halo exchange.
   Writes `halo_walltime_seconds` per iteration to a CSV.
+- `src/manual_profiling.jl`: adds NVTX range annotations for Nsight Systems
+  GPU profiling. Used with `run_files/profile_manual.sh`.
 
-Both take the same `--nx`, `--ny`, `--nt`, `--topo`, `--benchdir`, and
-`USE_GPU` options as `manual.jl`. They are used together with the analysis
-notebook `scripts/Benchmark_Analysis.ipynb` to separate compute time from
-communication time.
+All three take the same `--nx`, `--ny`, `--nt`, `--topo`, `--benchdir`, and
+`USE_GPU` options as `manual.jl`. The kernel and halo variants are used together
+with the analysis notebook `scripts/Benchmark_Analysis.ipynb` to separate compute
+time from communication time.
 
 ## Local Helper Scripts (run_files)
 
@@ -249,14 +252,8 @@ Related cluster scripts (`cluster_manual_*_4r.sh`, `cluster_manual_*_16r.sh`,
   directories (for example manual vs baseline) and prints the relative L2 error.
 - `test_topologies.jl`: compares two specific `--test` snapshot files and prints
   the relative error. Accepts an optional topology label.
-- `plot_strong_scaling.jl`: reads the strong-scaling CSVs and plots throughput
-  versus global problem size.
-- `test.py`: pure-Python helper that checks that the `(nx, ny)` grid sizes used
-  in the strong-scaling scripts satisfy the divisibility constraints for each
-  topology.
 - `Benchmark_Analysis.ipynb`: notebook that loads the benchmark, kernel, halo,
-  and strong-scaling CSVs and produces the report figures in a consistent
-  seaborn style.
+  and strong-scaling CSVs and produces the report figures.
 
 `--test` (in both `manual.jl` and `baseline.jl`) is an export mode: it
 initializes the state, writes the initial water depth `h` to the file given by
